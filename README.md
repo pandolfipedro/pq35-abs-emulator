@@ -16,7 +16,23 @@ On PQ35 vehicles, the ABS module is responsible for broadcasting the vehicle spe
 - ABS and ESP warning lights illuminate
 - Gateway (J533) logs fault `00625 — Speed signal, No signal/communication`
 
-This project replaces the faulty ABS module with an ESP32 + MCP2515 that reads the transmission speed from the CAN bus and re-broadcasts it as the original ABS module would.
+This project replaces the faulty ABS module with an ESP32 + MCP2515 that reads the transmission speed from the powertrain CAN bus and re-broadcasts it as the original ABS module would.
+
+---
+
+## Important: OBD-II port does NOT work
+
+The PQ35 platform has **three physically separate CAN buses**:
+
+| Bus | Wire codes | What's on it |
+|---|---|---|
+| **Powertrain CAN** | B383 (High), B390 (Low) | ECU, TCM, ABS, cluster speed signal |
+| Comfort CAN | B397 (High), B406 (Low) | Body control, doors, windows |
+| Infotainment CAN | A178 (High), A179 (Low) | Radio, navigation |
+
+The OBD-II port only exposes the **diagnostic bus** (gateway J533 pins 9/19), which is a separate channel used by scan tools. **Speed and ABS messages only travel on the Powertrain CAN** — they are never present on the OBD-II connector.
+
+You must tap directly into the powertrain CAN wiring inside the car.
 
 ---
 
@@ -32,6 +48,8 @@ This project replaces the faulty ABS module with an ESP32 + MCP2515 that reads t
 
 ## Wiring
 
+### ESP32 ↔ MCP2515
+
 ```
 MCP2515           ESP32 DevKit V1
 -------           ---------------
@@ -42,20 +60,27 @@ SCK       →       GPIO 18
 MOSI      →       GPIO 23
 MISO      →       GPIO 19
 INT       →       GPIO 4
-
-CANH      →       Vehicle CAN bus CANH
-CANL      →       Vehicle CAN bus CANL
 ```
 
 > **Important:** Power the MCP2515 from the ESP32 **VIN** pin (5V from USB), not from the 3.3V pin. The TJA1050 transceiver is rated for 5V — running it at 3.3V causes unstable CAN communication.
 
-### Vehicle connection points
+### MCP2515 ↔ Vehicle powertrain CAN bus
 
-On the ABS module 25-pin connector:
-- Pin **6** = CANH (orange/black wire)
-- Pin **14** = CANL (orange/brown wire)
+```
+MCP2515 CANH  →  Powertrain CAN High (orange/black wire — B383)
+MCP2515 CANL  →  Powertrain CAN Low  (orange/brown wire — B390)
+```
 
-You can also connect via the OBD-II port (pins 6 and 14) for bench testing.
+The easiest access point confirmed on the Jetta 2.5 2009 is directly at the **gateway J533 connector** (located in the driver's footwell, behind the dashboard):
+
+| Gateway J533 pin | Signal |
+|---|---|
+| Pin 16 | Powertrain CAN High |
+| Pin 6  | Powertrain CAN Low  |
+
+Alternatively, tap the same twisted pair at the **ABS module connector** or anywhere along the powertrain CAN harness. The wire colors are consistently orange/black (High) and orange/brown (Low) throughout the car.
+
+> **Do not use the OBD-II port.** The powertrain CAN bus is not routed there. Connecting via OBD-II will result in no data being received or transmitted.
 
 ---
 
@@ -198,7 +223,7 @@ Tested on VW Jetta 2.5 2009. Should work on any PQ35 platform vehicle:
 | Seat Leon MK2 (2005–2012) | Expected to work |
 | Skoda Octavia MK2 (2004–2013) | Expected to work |
 
-If you test on any of these models, please open an issue with your results.
+If you test on any of these models, please open an issue with your findings.
 
 ---
 
@@ -208,6 +233,8 @@ If you test on any of these models, please open an issue with your results.
 - [CAN BUS Gaming Simulator — Hackaday](https://hackaday.io/project/6288) — VW PQ35 CAN ID mapping
 - [Vehicle Reverse Engineering Wiki — Volkswagen](https://vehicle-reverse-engineering.fandom.com/wiki/Volkswagen) — real CAN log from VW Passat B6 PQ35
 - [Autosport Labs MK5 CAN Preset](https://www.autosportlabs.com/2006-2010-vw-mk5-can-bus-preset-now-available/) — confirmed wheel speed channels
+- [Gateway J533 pinout — MHH Auto](https://mhhauto.com/Thread-I-need-pinout-gateway-VAG-1K0907530H) — powertrain CAN pins confirmed
+- [PQ35 CAN bus wiring — VW Forum UK](https://www.volkswagenforum.co.uk/threads/cable-path-for-canbus.42493/) — wire codes B383/B390 confirmed
 
 ---
 
