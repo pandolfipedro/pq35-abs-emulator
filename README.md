@@ -1,5 +1,7 @@
 # PQ35 ABS Module Emulator
 
+> 🇧🇷 [Leia em Português](README.pt-BR.md)
+
 **ESP32 + MCP2515** emulator for the ABS module on **Volkswagen PQ35 platform vehicles** (Jetta MK5, Golf MK5, Passat B6, Audi A3 8P, Seat Leon MK2).
 
 Developed and tested on a **VW Jetta 2.5 2009** with a burned-out ABS module (part suffix **AD**).
@@ -24,11 +26,11 @@ This project replaces the faulty ABS module with an ESP32 + MCP2515 that reads t
 
 The PQ35 platform has **three physically separate CAN buses**:
 
-| Bus | Wire codes | What's on it |
+| Bus | Wire colors | What's on it |
 |---|---|---|
-| **Powertrain CAN** | B383 (High), B390 (Low) | ECU, TCM, ABS, cluster speed signal |
-| Comfort CAN | B397 (High), B406 (Low) | Body control, doors, windows |
-| Infotainment CAN | A178 (High), A179 (Low) | Radio, navigation |
+| **Powertrain CAN** | Orange/black (High), Orange/brown (Low) | ECU, TCM, ABS, cluster speed signal |
+| Comfort CAN | — | Body control, doors, windows |
+| Infotainment CAN | — | Radio, navigation |
 
 The OBD-II port only exposes the **diagnostic bus** (gateway J533 pins 9/19), which is a separate channel used by scan tools. **Speed and ABS messages only travel on the Powertrain CAN** — they are never present on the OBD-II connector.
 
@@ -73,12 +75,12 @@ MCP2515 CANL  →  Powertrain CAN Low  (orange/brown wire — B390)
 
 The easiest access point confirmed on the Jetta 2.5 2009 is directly at the **gateway J533 connector** (located in the driver's footwell, behind the dashboard):
 
-| Gateway J533 pin | Signal |
-|---|---|
-| Pin 16 | Powertrain CAN High |
-| Pin 6  | Powertrain CAN Low  |
+| Gateway J533 pin | Signal | Wire color |
+|---|---|---|
+| Pin 16 | Powertrain CAN High | Orange/black |
+| Pin 6  | Powertrain CAN Low  | Orange/brown |
 
-Alternatively, tap the same twisted pair at the **ABS module connector** or anywhere along the powertrain CAN harness. The wire colors are consistently orange/black (High) and orange/brown (Low) throughout the car.
+Alternatively, tap the same twisted pair at the **ABS module connector** or anywhere along the powertrain CAN harness.
 
 > **Do not use the OBD-II port.** The powertrain CAN bus is not routed there. Connecting via OBD-II will result in no data being received or transmitted.
 
@@ -223,7 +225,7 @@ Tested on VW Jetta 2.5 2009. Should work on any PQ35 platform vehicle:
 | Seat Leon MK2 (2005–2012) | Expected to work |
 | Skoda Octavia MK2 (2004–2013) | Expected to work |
 
-If you test on any of these models, please open an issue with your findings.
+If you test on any of these models, please open an issue with your results.
 
 ---
 
@@ -233,8 +235,6 @@ If you test on any of these models, please open an issue with your findings.
 - [CAN BUS Gaming Simulator — Hackaday](https://hackaday.io/project/6288) — VW PQ35 CAN ID mapping
 - [Vehicle Reverse Engineering Wiki — Volkswagen](https://vehicle-reverse-engineering.fandom.com/wiki/Volkswagen) — real CAN log from VW Passat B6 PQ35
 - [Autosport Labs MK5 CAN Preset](https://www.autosportlabs.com/2006-2010-vw-mk5-can-bus-preset-now-available/) — confirmed wheel speed channels
-- [Gateway J533 pinout — MHH Auto](https://mhhauto.com/Thread-I-need-pinout-gateway-VAG-1K0907530H) — powertrain CAN pins confirmed
-- [PQ35 CAN bus wiring — VW Forum UK](https://www.volkswagenforum.co.uk/threads/cable-path-for-canbus.42493/) — wire codes B383/B390 confirmed
 
 ---
 
