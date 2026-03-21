@@ -1,330 +1,305 @@
-// ================================================================
-//  PQ35 ABS Module Emulator
-//  ESP32 DevKit V1 + MCP2515
-//
-//  Emulates the ABS module on Volkswagen PQ35 platform vehicles
-//  (Jetta MK5, Golf MK5, Passat B6, Audi A3 8P, Seat Leon MK2)
-//
-//  How it works:
-//    1. Listens to the powertrain CAN bus
-//    2. Reads vehicle speed from frame 0x540 (Getriebe_2), sent by TCM
-//    3. Re-broadcasts speed as the original ABS module would:
-//       - 0x5A0  Bremse_2  (10ms) — speedometer + distance counter
-//       - 0x1A0  Bremse_1  (10ms) — wheel speed for ECU and TCM
-//       - 0x4A0  Bremse_3  (50ms) — ABS/ESP module keepalive
-//
-//  Wiring — MCP2515 to ESP32:
-//    VCC   →  VIN   (5V from USB — do NOT use 3.3V pin)
-//    GND   →  GND
-//    CS    →  GPIO 5
-//    SCK   →  GPIO 18
-//    MOSI  →  GPIO 23
-//    MISO  →  GPIO 19
-//    INT   →  GPIO 4
-//
-//  Wiring — MCP2515 to vehicle:
-//    CANH  →  Powertrain CAN High (orange/black wire — B383)
-//    CANL  →  Powertrain CAN Low  (orange/brown wire  — B390)
-//
-//  Access point confirmed on Jetta 2.5 2009:
-//    Gateway J533 connector, pin 16 (CANH) and pin 6 (CANL)
-//
-//  WARNING: Do NOT connect via OBD-II port.
-//    The powertrain CAN bus is NOT routed to the OBD-II connector.
-//    You must tap directly into the powertrain CAN wiring.
-//
-//  MCP2515 crystal:
-//    8 MHz  board → MCP_8MHZ  (default below)
-//    16 MHz board → change to MCP_16MHZ
-//
-//  Library required: MCP_CAN by coryjfowler
-//    Arduino IDE → Tools → Manage Libraries → search "MCP_CAN"
-// ================================================================
+/*
+ * VW Jetta 2009 - Bypass ABS via CAN Bus
+ * ESP32 + MCP2515 (TJA1050)
+ *
+ * Lê velocidade da TCU via OBD2 (0x7E1/0x7E9)
+ * e envia mensagens ABS (0x1A0, 0x4A0, 0x5A0)
+ *
+ * MODOS:
+ *   0 = BYPASS - Uso normal no veículo
+ *   2 = TESTE  - Velocidade manual via Serial
+ *   4 = OBD2   - Teste de comunicação OBD2
+ */
 
 #include <SPI.h>
 #include <mcp_can.h>
 
-// ── Pin definitions ────────────────────────────────────────────
-#define PIN_CAN_CS   5
-#define PIN_CAN_INT  4
+// ===================== CONFIGURAÇÃO =====================
 
-MCP_CAN CAN(PIN_CAN_CS);
+#define MODO_OPERACAO  0
 
-// ── CAN IDs — received (TCM → emulator) ───────────────────────
-// 0x540 = Getriebe_2: transmission output speed frame sent by TCM
-#define ID_GETRIEBE_2   0x540
+// Pinos MCP2515
+#define PIN_CAN_CS    5
+#define PIN_CAN_INT   2
+#define PIN_SPI_SCK   18
+#define PIN_SPI_MISO  19
+#define PIN_SPI_MOSI  23
+#define MCP_CRYSTAL   MCP_8MHZ
 
-// ── CAN IDs — transmitted (emulator → bus) ────────────────────
-#define ID_BREMSE_2     0x5A0   // Speedometer (cluster)
-#define ID_BREMSE_1     0x1A0   // Wheel speed (ECU, TCM)
-#define ID_BREMSE_3     0x4A0   // ABS/ESP keepalive
+// OBD2 - TCU (câmbio)
+#define OBD2_REQUEST_ID   0x7E1
+#define OBD2_RESPONSE_ID  0x7E9
+#define OBD2_INTERVAL     80    // ms entre pedidos
 
-// ── Speed encoding factor ──────────────────────────────────────
-// Confirmed formula for PQ35 (tested on real hardware):
-//   raw = km/h × 148  →  km/h = raw / 148
-// If speedometer reads differently from GPS, adjust this value.
-// Alternative factor reported for some PQ35 transmissions: 322.0
-#define SPEED_FACTOR    148.0f
+// Calibração do velocímetro (0x5A0)
+// Pneu 205/55R16 → circunferência ~1.985m → fator ~70
+// Se painel mostra MUITO: diminua. POUCO: aumente.
+#define SPEED_FACTOR_5A0    70.0
+#define SPEED_FACTOR_WHEEL  100.0
 
-// ── Distance counter (0x5A0 bytes 5–6) ────────────────────────
-// 50 counts per meter traveled, overflow at 30000.
-// CRITICAL: this counter MUST be incremented proportionally to
-// speed. Without it, the speedometer needle rises for ~10 seconds
-// and then drops — a well-documented PQ35 behavior.
-#define COUNTS_PER_METER  50.0f
-#define DIST_OVERFLOW     30000
+// Intervalos de envio das mensagens ABS (ms)
+#define INTERVALO_1A0  10
+#define INTERVALO_4A0  10
+#define INTERVALO_5A0  20
 
-// ── Timing ─────────────────────────────────────────────────────
-#define INTERVAL_FAST_MS   10   // 100 Hz — 0x5A0 and 0x1A0
-#define INTERVAL_SLOW_MS   50   // 20 Hz  — 0x4A0 keepalive
+// Desaceleração máxima permitida no cache (km/h por segundo)
+// ~1g de frenagem ≈ 36 km/h/s. Margem extra para segurança.
+#define MAX_DESACEL    40.0
 
-// ── State ──────────────────────────────────────────────────────
-float    speedKmh      = 0.0f;  // Current speed in km/h
-uint32_t lastRxTime    = 0;     // Timestamp of last 0x540 received
-uint32_t lastFastTick  = 0;     // Fast loop timer
-uint32_t lastSlowTick  = 0;     // Slow loop timer
+// ===================== VARIÁVEIS =====================
 
-// Distance counter
-float    distAccum     = 0.0f;  // Sub-meter accumulator
-uint16_t distCounter   = 0;     // Integer counter (0..29999)
+MCP_CAN CAN0(PIN_CAN_CS);
+bool canOk = false;
 
-// Frame life counter (incremented on every transmission)
-uint8_t  frameCount    = 0;
+long unsigned int rxId;
+unsigned char rxLen = 0;
+unsigned char rxBuf[8];
 
-// Moving average filter (smooths TCM speed readings)
-#define  AVG_SAMPLES  5
-float    avgBuf[AVG_SAMPLES] = {0};
-uint8_t  avgIdx               = 0;
+// Cache de velocidade
+float velCache = 0.0;           // Velocidade "confiável" usada pelo painel
+unsigned long tUltimaLeitura = 0; // Quando recebeu última resposta OBD2
+unsigned long tUltimoCache = 0;   // Quando atualizou o cache por último
 
-// ================================================================
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println(F("\n=== PQ35 ABS Emulator ==="));
+// Contadores para mensagens ABS
+uint8_t contadorAlive = 0;
+uint16_t timestamp5A0 = 0;
 
-  // Initialize MCP2515
-  // CAN_500KBPS = VAG powertrain CAN bus speed
-  // MCP_8MHZ    = crystal on your MCP2515 board (change to MCP_16MHZ if needed)
-  uint8_t attempt = 0;
-  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
-    Serial.printf("[INIT] MCP2515 failed (attempt %d). Check:\n", ++attempt);
-    Serial.println(F("  - MCP2515 VCC connected to VIN (5V), not 3.3V"));
-    Serial.println(F("  - SPI pins: CS=5, SCK=18, MOSI=23, MISO=19"));
-    Serial.println(F("  - Crystal: MCP_8MHZ or MCP_16MHZ?"));
-    delay(1000);
-    if (attempt >= 15) {
-      Serial.println(F("[INIT] CRITICAL FAILURE. Halting."));
-      while (true) delay(1000);
-    }
+// Timers
+unsigned long tEnvio1A0 = 0, tEnvio4A0 = 0, tEnvio5A0 = 0;
+unsigned long tOBD2Req = 0, tLog = 0;
+
+// ===================== CACHE DE VELOCIDADE =====================
+// Se está a 20 km/h e chega 0, isso é impossível em 80ms.
+// O cache só permite queda proporcional à frenagem real.
+// Aceleração é livre (resposta rápida ao acelerar).
+
+void atualizarCache(float novaVel) {
+  unsigned long agora = millis();
+  float dt = (agora - tUltimoCache) / 1000.0;
+  if (dt <= 0) dt = 0.001;
+
+  float quedaMax = MAX_DESACEL * dt;
+
+  if (novaVel >= velCache) {
+    velCache = novaVel;
+  } else if (velCache - novaVel > quedaMax) {
+    velCache -= quedaMax;
+  } else {
+    velCache = novaVel;
   }
 
-  // Configure hardware RX filters — accept only 0x540 (Getriebe_2)
-  // This prevents the ESP32 from processing every frame on the bus
-  CAN.init_Mask(0, 0, 0x7FF);
-  CAN.init_Mask(1, 0, 0x7FF);
-  CAN.init_Filt(0, 0, ID_GETRIEBE_2);
-  CAN.init_Filt(1, 0, ID_GETRIEBE_2);
-  CAN.init_Filt(2, 0, ID_GETRIEBE_2);
-  CAN.init_Filt(3, 0, ID_GETRIEBE_2);
-  CAN.init_Filt(4, 0, ID_GETRIEBE_2);
-  CAN.init_Filt(5, 0, ID_GETRIEBE_2);
-
-  CAN.setMode(MCP_NORMAL);
-  // For bench testing without the car, use MCP_LOOPBACK instead:
-  // CAN.setMode(MCP_LOOPBACK);
-
-  Serial.println(F("[INIT] CAN bus OK — 500 kbps"));
-  Serial.println(F("[INIT] Listening : 0x540 (Getriebe_2 from TCM)"));
-  Serial.println(F("[INIT] Sending   : 0x5A0 (speedometer), 0x1A0 (wheel speed), 0x4A0 (ABS status)"));
-  Serial.println(F("[INIT] Ready.\n"));
+  if (velCache < 0.5) velCache = 0.0;
+  tUltimoCache = agora;
 }
 
-// ================================================================
-void loop() {
-  uint32_t now = millis();
-
-  readCAN(now);
-  checkTimeout(now);
-
-  // Fast loop — 10ms (100 Hz)
-  if (now - lastFastTick >= INTERVAL_FAST_MS) {
-    uint32_t dt = now - lastFastTick;
-    lastFastTick = now;
-    frameCount++;
-
-    // Update distance counter
-    // distance(m) = speed(m/s) × time(s) = (km/h / 3.6) × (dt / 1000)
-    float distM = (speedKmh / 3.6f) * (dt / 1000.0f);
-    distAccum += distM;
-    uint32_t newCounts = (uint32_t)(distAccum * COUNTS_PER_METER);
-    if (newCounts > 0) {
-      distAccum -= newCounts / COUNTS_PER_METER;
-      distCounter = (distCounter + newCounts) % DIST_OVERFLOW;
-    }
-
-    sendBremse2();
-    sendBremse1();
-  }
-
-  // Slow loop — 50ms (20 Hz)
-  if (now - lastSlowTick >= INTERVAL_SLOW_MS) {
-    lastSlowTick = now;
-    sendBremse3();
+// Decaimento natural: se não chega resposta, freia suavemente
+void decairCache() {
+  unsigned long agora = millis();
+  if (agora - tUltimaLeitura > 300) {
+    float dt = (agora - tUltimoCache) / 1000.0;
+    float queda = MAX_DESACEL * 0.5 * dt;  // decai mais devagar que frenagem
+    velCache -= queda;
+    if (velCache < 0.5) velCache = 0.0;
+    tUltimoCache = agora;
   }
 }
 
-// ================================================================
-// Read 0x540 (Getriebe_2) from TCM and extract vehicle speed
-//
-// Frame format (VAG PQ35 KMatrix confirmed):
-//   Byte 0: TCM sequence counter
-//   Byte 1: Speed HIGH byte
-//   Byte 2: Speed LOW byte
-//   Byte 3–7: Transmission status, gear position, flags
-//
-// Decoding: raw = (byte1 << 8) | byte2
-//           km/h = raw / SPEED_FACTOR
-//
-// Calibration: if speedometer differs from GPS, adjust SPEED_FACTOR.
-//   Open Serial Monitor (115200 baud), note the raw= value at a
-//   known GPS speed, then: SPEED_FACTOR = raw / gps_speed_kmh
-// ================================================================
-void readCAN(uint32_t now) {
-  if (digitalRead(PIN_CAN_INT) == LOW) {
-    uint32_t rxId;
-    uint8_t  rxLen;
-    uint8_t  buf[8];
+// ===================== OBD2 =====================
 
-    if (CAN.readMsgBuf(&rxId, &rxLen, buf) == CAN_OK
-        && rxId == ID_GETRIEBE_2
-        && rxLen >= 3) {
+void enviarPedidoOBD2() {
+  uint8_t pedido[8] = {0x02, 0x01, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00};
+  CAN0.sendMsgBuf(OBD2_REQUEST_ID, 0, 8, pedido);
+}
 
-      uint16_t rawSpeed = ((uint16_t)buf[1] << 8) | buf[2];
-      float newSpeed = rawSpeed / SPEED_FACTOR;
+bool lerRespostaOBD2() {
+  bool recebeu = false;
+  while (digitalRead(PIN_CAN_INT) == LOW) {
+    CAN0.readMsgBuf(&rxId, &rxLen, rxBuf);
+    unsigned long id = rxId & 0x7FF;
 
-      // Clamp to reasonable range
-      newSpeed = constrain(newSpeed, 0.0f, 280.0f);
+    if (id == OBD2_RESPONSE_ID && rxBuf[1] == 0x41 && rxBuf[2] == 0x0D) {
+      float vel = (float)rxBuf[3];
+      atualizarCache(vel);
+      tUltimaLeitura = millis();
+      recebeu = true;
+    }
+  }
+  return recebeu;
+}
 
-      // Moving average filter
-      avgBuf[avgIdx] = newSpeed;
-      avgIdx = (avgIdx + 1) % AVG_SAMPLES;
-      float sum = 0;
-      for (uint8_t i = 0; i < AVG_SAMPLES; i++) sum += avgBuf[i];
-      speedKmh = sum / AVG_SAMPLES;
+// ===================== MENSAGENS ABS =====================
 
-      lastRxTime = now;
+void enviarBremse1(float speedKmh) {
+  uint16_t sv = (uint16_t)(speedKmh * SPEED_FACTOR_WHEEL);
+  uint8_t data[8] = {
+    (uint8_t)(speedKmh > 0.5 ? 0x01 : 0x00),
+    0x00,
+    (uint8_t)(sv & 0xFF),
+    (uint8_t)((sv >> 8) & 0xFF),
+    0xFE, 0xFE,
+    (uint8_t)((contadorAlive & 0x0F) << 4),
+    0x00
+  };
+  CAN0.sendMsgBuf(0x1A0, 0, 8, data);
+}
 
-      // Log once per second (~100 fast cycles)
-      static uint8_t logTick = 0;
-      if (++logTick >= 100) {
-        logTick = 0;
-        Serial.printf("[RX 0x540] raw=%5u | speed=%6.1f km/h | distCnt=%5u\n",
-                      rawSpeed, speedKmh, distCounter);
+void enviarBremse3(float speedKmh) {
+  uint16_t ws = (uint16_t)(speedKmh * SPEED_FACTOR_WHEEL) & 0xFFFE;
+  uint8_t lo = ws & 0xFF;
+  uint8_t hi = (ws >> 8) & 0xFF;
+  uint8_t data[8] = { lo, hi, lo, hi, lo, hi, lo, hi };
+  CAN0.sendMsgBuf(0x4A0, 0, 8, data);
+}
+
+void enviarBremse2(float speedKmh) {
+  uint16_t sr = (uint16_t)(speedKmh * SPEED_FACTOR_5A0);
+  uint16_t val = (sr << 1) & 0xFFFE;
+  timestamp5A0++;
+  uint8_t data[8] = {
+    0x80,
+    (uint8_t)(val & 0xFF),
+    (uint8_t)((val >> 8) & 0xFF),
+    (uint8_t)(timestamp5A0 & 0xFF),
+    (uint8_t)((timestamp5A0 >> 8) & 0xFF),
+    0x00, 0x00, 0xAD
+  };
+  CAN0.sendMsgBuf(0x5A0, 0, 8, data);
+  contadorAlive++;
+}
+
+void enviarTodasABS(float speedKmh) {
+  unsigned long agora = millis();
+  if (agora - tEnvio1A0 >= INTERVALO_1A0) {
+    enviarBremse1(speedKmh);
+    tEnvio1A0 = agora;
+  }
+  if (agora - tEnvio4A0 >= INTERVALO_4A0) {
+    enviarBremse3(speedKmh);
+    tEnvio4A0 = agora;
+  }
+  if (agora - tEnvio5A0 >= INTERVALO_5A0) {
+    enviarBremse2(speedKmh);
+    tEnvio5A0 = agora;
+  }
+}
+
+// ===================== MODO BYPASS =====================
+
+void loopBypass() {
+  unsigned long agora = millis();
+
+  if (agora - tOBD2Req >= OBD2_INTERVAL) {
+    enviarPedidoOBD2();
+    tOBD2Req = agora;
+  }
+
+  lerRespostaOBD2();
+  decairCache();
+  enviarTodasABS(velCache);
+
+  if (agora - tLog >= 1000) {
+    Serial.print("[BYPASS] ");
+    Serial.print(velCache, 0);
+    Serial.println(" km/h");
+    tLog = agora;
+  }
+}
+
+// ===================== MODO TESTE =====================
+
+void loopTeste() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() > 0) {
+      float v = input.toFloat();
+      if (v >= 0 && v <= 280) {
+        velCache = v;
+        Serial.print("[TESTE] ");
+        Serial.print(v, 0);
+        Serial.println(" km/h");
       }
     }
   }
-}
 
-// ================================================================
-// Timeout: if no 0x540 received for 500ms, assume vehicle stopped
-// ================================================================
-void checkTimeout(uint32_t now) {
-  if (speedKmh > 0.1f && (now - lastRxTime) > 500) {
-    speedKmh = 0.0f;
-    for (uint8_t i = 0; i < AVG_SAMPLES; i++) avgBuf[i] = 0;
-    Serial.println(F("[TIMEOUT] 0x540 lost — speed set to zero"));
+  enviarTodasABS(velCache);
+
+  unsigned long agora = millis();
+  if (agora - tLog >= 2000) {
+    Serial.print("[TESTE] ");
+    Serial.print(velCache, 0);
+    Serial.println(" km/h");
+    tLog = agora;
   }
 }
 
-// ================================================================
-// 0x5A0 — Bremse_2 — Cluster speedometer
-//
-// Source: github.com/an-ven/VW-Instrument-Cluster-Controller
-//         Tested on VW UP (PQ35), confirmed working.
-//
-// Byte 0: 0xFF (fixed)
-// Byte 1: LSB(raw_speed)    raw = km/h × 148
-// Byte 2: MSB(raw_speed)
-// Byte 3: flags (bit 3 = tire pressure warning)
-// Byte 4: 0x00
-// Byte 5: LSB(distCounter)  50 counts/meter, overflow at 30000
-// Byte 6: MSB(distCounter)
-// Byte 7: 0xAD (fixed PQ35 frame identifier)
-// ================================================================
-void sendBremse2() {
-  uint16_t rawSpeed = (uint16_t)(speedKmh * SPEED_FACTOR);
+// ===================== MODO OBD2 (teste) =====================
 
-  uint8_t data[8] = {
-    0xFF,
-    (uint8_t)(rawSpeed & 0xFF),           // Byte 1: speed LSB
-    (uint8_t)((rawSpeed >> 8) & 0xFF),    // Byte 2: speed MSB
-    0x00,                                 // Byte 3: flags (normal)
-    0x00,
-    (uint8_t)(distCounter & 0xFF),        // Byte 5: distance LSB
-    (uint8_t)((distCounter >> 8) & 0xFF), // Byte 6: distance MSB
-    0xAD                                  // Byte 7: fixed
-  };
+void loopOBD2() {
+  static unsigned long tReq = 0, tPrint = 0;
+  static uint32_t reqCount = 0, rspCount = 0;
+  unsigned long agora = millis();
 
-  if (CAN.sendMsgBuf(ID_BREMSE_2, 0, 8, data) != CAN_OK)
-    Serial.println(F("[TX ERR] 0x5A0"));
+  if (agora - tReq >= 200) {
+    enviarPedidoOBD2();
+    reqCount++;
+    tReq = agora;
+  }
+
+  while (digitalRead(PIN_CAN_INT) == LOW) {
+    CAN0.readMsgBuf(&rxId, &rxLen, rxBuf);
+    if ((rxId & 0x7FF) == OBD2_RESPONSE_ID && rxBuf[1] == 0x41 && rxBuf[2] == 0x0D) {
+      rspCount++;
+      Serial.print("[OBD2] ");
+      Serial.print(rxBuf[3]);
+      Serial.println(" km/h");
+    }
+  }
+
+  enviarTodasABS(0);
+
+  if (agora - tPrint >= 3000) {
+    Serial.print("[OBD2] req=");
+    Serial.print(reqCount);
+    Serial.print(" rsp=");
+    Serial.println(rspCount);
+    tPrint = agora;
+  }
 }
 
-// ================================================================
-// 0x1A0 — Bremse_1 — Wheel speed for ECU and TCM
-//
-// Source: vehicle-reverse-engineering.fandom.com/wiki/Volkswagen
-//         Real CAN log from VW Passat B6 PQ35.
-//
-// Byte 0: 0x18 (normal status — no ABS intervention)
-// Byte 1: speed LSB   raw = km/h × 148
-// Byte 2: speed MSB
-// Byte 3: ABS/ESP flags
-//           0x00 = normal
-//           0x04 = ABS active
-//           0x81 = ABS warning light
-//           0x84 = handbrake applied
-// Byte 4: 0xFE (fixed)
-// Byte 5: 0xFE (fixed)
-// Byte 6: 0x00
-// Byte 7: frame life counter
-// ================================================================
-void sendBremse1() {
-  uint16_t rawSpeed = (uint16_t)(speedKmh * SPEED_FACTOR);
+// ===================== SETUP & LOOP =====================
 
-  uint8_t data[8] = {
-    0x18,                                 // Byte 0: normal status
-    (uint8_t)(rawSpeed & 0xFF),           // Byte 1: speed LSB
-    (uint8_t)((rawSpeed >> 8) & 0xFF),    // Byte 2: speed MSB
-    0x00,                                 // Byte 3: no ABS/ESP intervention
-    0xFE,                                 // Byte 4: fixed
-    0xFE,                                 // Byte 5: fixed
-    0x00,
-    frameCount                            // Byte 7: life counter
-  };
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("VW Jetta 2009 - ABS Bypass v2.0");
 
-  if (CAN.sendMsgBuf(ID_BREMSE_1, 0, 8, data) != CAN_OK)
-    Serial.println(F("[TX ERR] 0x1A0"));
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_CAN_CS);
+
+  if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_CRYSTAL) == CAN_OK) {
+    CAN0.setMode(MCP_NORMAL);
+    pinMode(PIN_CAN_INT, INPUT);
+    canOk = true;
+    Serial.println("CAN OK - 500kbps");
+  } else {
+    Serial.println("ERRO: MCP2515 falhou!");
+  }
+
+  switch (MODO_OPERACAO) {
+    case 0: Serial.println("Modo: BYPASS"); break;
+    case 2: Serial.println("Modo: TESTE (digite km/h)"); break;
+    case 4: Serial.println("Modo: OBD2 (teste)"); break;
+  }
+
+  tUltimoCache = millis();
 }
 
-// ================================================================
-// 0x4A0 — Bremse_3 — ABS/ESP module keepalive
-//
-// Informs the bus that the ABS module is present and healthy.
-// Without this frame, the cluster and ECU will flag a module
-// communication fault.
-// ================================================================
-void sendBremse3() {
-  uint8_t data[8] = {
-    0x00,   // No faults
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    frameCount  // Life counter
-  };
+void loop() {
+  if (!canOk) { delay(1000); return; }
 
-  if (CAN.sendMsgBuf(ID_BREMSE_3, 0, 8, data) != CAN_OK)
-    Serial.println(F("[TX ERR] 0x4A0"));
+  switch (MODO_OPERACAO) {
+    case 0: loopBypass(); break;
+    case 2: loopTeste();  break;
+    case 4: loopOBD2();   break;
+  }
 }
