@@ -96,19 +96,17 @@ TCU (câmbio 09G)
       │  Publica a cada 10 ms:
       ├─ 0x1A0  Bremse_1  — velocidade principal + estado do freio
       ├─ 0x4A0  Bremse_3  — velocidade das 4 rodas individualmente
-      ├─ 0x4A8  Bremse_4  — pressão hidráulica de frenagem simulada
+      ├─ 0x4A8  Bremse_5  — pressão hidráulica de frenagem simulada e Yaw Rate
       │
       │  Publica a cada 20 ms:
-      ├─ 0x5A0  Bremse_2  — velocidade média + acumulador de pulsos (Wegimpulse)
-      ├─ 0xDA0  ABS Alive — keepalive do módulo ABS para o cluster
-      └─ 0x289  Bremse_5  — flag ESP OK / freio (libera Cruise Control)
+      └─ 0x5A0  Bremse_2  — velocidade média + acumulador de pulsos (Wegimpulse) + apagar luzes ABS
 
 ECU Motor
       │
       │  Motor_2 — 0x288, byte2 bits 0-1 = dual brake switch
       ▼
    Leitura via filtro hardware RXB1
-   Estado do freio refletido em 0x1A0, 0x4A8 e 0x289
+   Estado do freio refletido nativamente em 0x4A8 (Bremse_5) para o Piloto Automático
 ```
 
 ---
@@ -119,12 +117,10 @@ ECU Motor
 
 | ID | Nome | Intervalo | Função |
 |---|---|---|---|
-| `0x1A0` | Bremse_1 | 10 ms | Velocidade principal com checksum XOR + flag de freio |
-| `0x4A0` | Bremse_3 | 10 ms | Velocidade das 4 rodas (mesmo valor, direção para frente) |
-| `0x4A8` | Bremse_4 | 10 ms | Pressão hidráulica simulada (plausibilidade ABS / Cruise) |
-| `0x5A0` | Bremse_2 | 20 ms | Velocidade + timestamp + acumulador Wegimpulse 11-bit |
-| `0xDA0` | ABS Alive | 20 ms | Keepalive do módulo ABS — evita limp mode no cluster |
-| `0x289` | Bremse_5 | 20 ms | Sinalização redundante ESP OK / freio para a ECU do motor |
+| `0x1A0` | Bremse_1 | 10 ms | Velocidade principal com checksum XOR + Flags de validação ASR/ESP |
+| `0x4A0` | Bremse_3 | 10 ms | Velocidade das 4 rodas (mesmo valor, evita limp mode no Câmbio Auto) |
+| `0x4A8` | Bremse_5 | 10 ms | Pressão hidráulica, Yaw Rate simulados e flag do pedal de freio (Libera Cruise Control) |
+| `0x5A0` | Bremse_2 | 20 ms | Velocidade (Painel), apaga luzes Falha ABS/Freio + Acumulador Wegimpulse 11-bit |
 
 ### Recebidas
 
@@ -195,10 +191,10 @@ Acumulador fracionário float → contador 11-bit com wrap em 2047
 
 O VW usa dois switches de freio que ativam em momentos distintos do curso do pedal. A sequência de bits ao frear é `00 → 01 → 03 → 02 → 00`. A leitura correta usa `(byte2 & 0x03)` — capturar apenas bit0 perde o estado intermediário `0x02`.
 
-O estado é refletido em:
-- `0x1A0` byte 1 = `0x18` (bits 3+4) quando ativo
-- `0x4A8` bytes 2–3: pressão simulada de linha
-- `0x289` byte 1 bit 1: sinalização de freio para a ECU
+O estado é refletido de volta para a eletrônica em:
+- `0x4A8` (Bremse_5) bytes 2–3: injeta a pressão virtual (Ex: `0x0400` bar).
+- `0x4A8` (Bremse_5) byte 5: Ativa o bit nativo de Lâmpada de freio (`0x08`).
+*(Atenção: A adoção de uso da flag de freio "0x18" na `0x1A0` quebrava a plausibilidade e derrubava a agulha de velocidade, sendo descontinuada na vFINAL)*.
 
 ### Checksum — Bremse_1 (0x1A0)
 
@@ -217,27 +213,30 @@ O loop monitora o contador de erros de transmissão do MCP2515 a cada 2 s. Se ul
 Baud rate: **115200**
 
 ```text
-[v9.0] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
+[vFINAL] vel=87.3 freio=0 
+[vFINAL] vel=0.0 freio=0 | ERRO CAN: txErr=54 busOff=0
 ```
 
 | Campo | Descrição |
 |---|---|
 | `vel` | Velocidade sendo enviada ao painel neste momento (km/h) |
 | `freio` | Estado do pedal lido do `0x288` (`0` = solto, `1` = pressionado) |
-| `weg` | Posição atual do acumulador Wegimpulse (0–2047) |
-| `obd` | Tempo desde a última resposta válida da TCU (ms) |
-| `reads` | Total de leituras CAN recebidas desde o boot |
-| `txOk` / `txErr` | Frames enviados com sucesso / frames com erro de transmissão |
-| `busOff` | Reinicializações por BUS-OFF (> 0 indica problema de hardware — verificar J1) |
+| `ERRO CAN`| Omitido quando saudável. Se aparecer, mostra falhas do MCP2515 (ex: carro em modo Sleep impedindo envio). |
+| `txErr` | Acúmulo de frames barrados (rede dormindo ou desconectada) |
+| `busOff`| Reinicializações por falha severa (> 0 indica curtos físicos de hardware ou presença incorreta do J1) |
 
 ---
 
 ## Histórico de versões
 
+### vFINAL (K-Matrix Compliance)
+- **Sintaxe K-Matrix Oficial:** Estruturamento de Checksums, counters (Pulsos vivos) e flags para 1A0, 4A0, 4A8, e 5A0, clonando a placa MK60 integralmente.
+- **Remoção Anti-Diagnóstico:** Deleção da mensagem fantasma (0xDA0) que causava hodômetro disparar devido ao acionamento do Modo Manutenção / Teste de Bancada do painel. Extinção da ID 0x289 (Restrita a MQB).
+- **Ressurreição do Cruise Control:** Injeção de BR5_Bremsdruck (Pressão), BR5_Sta_Gierrate e cálculo de Cheksum implementados do zero no 0x4A8. Lâmpadas do ABS enraizadas como "Off" (0x05) no 0x5A0.
+- **Estabilidade do Velocímetro:** Abolido erro experimental `0x18` no Byte 1 (`1A0`) que forçava a agulha ao declínio.
+
 ### v9.0
-- **Dual brake switch corrigido:** leitura passa a usar `(byte2 & 0x03)` capturando ambos os switches
-- **`0x1A0` brake flag:** corrigido de `0x08` para `0x18` (bits 3+4, conforme OSM VW-CAN wiki)
-- **`0x4A8` Bremse_4 adicionado:** pressão hidráulica simulada, exigida pelos verificadores de plausibilidade do Cruise Control em variantes mais recentes do PQ35
+- **Dual brake switch adicionado:** leitura passa a usar `(byte2 & 0x03)` capturando ambos os switches. Emissão primária do frame simulado `0x4A8`.
 
 ### v8.1
 - Leitura do pedal de freio migrada para CAN (`0x288`) — elimina o fio secundário ao ESP32
