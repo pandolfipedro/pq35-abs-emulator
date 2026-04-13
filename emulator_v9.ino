@@ -1,33 +1,7 @@
-/*
- * VW Jetta 2009 - Bypass ABS via CAN Bus
- * ESP32 + MCP2515 (TJA1050)
- *
- * Lê velocidade da TCU via OBD2 (0x7E1 / 0x7E9)
- * e envia mensagens ABS (0x1A0, 0x4A0, 0x5A0, 0xDA0, 0x289)
- *
- * Ref: https://the07k.wiki/wiki/Can-bus_emulation_for_cruise_control
- *      PQ35/46 ACAN KMatrix V5.20.6F
- *      vw_golf_mk4.dbc (commaai/opendbc)
- *
- * v8 - Correções críticas:
- *   - 0x5A0 fator corrigido: 73.0 → 100.0 (igual 0x1A0/0x4A0, fonte: KMatrix oficial)
- *   - 0x5A0 BR2_Wegimpulse adicionado (bytes 6-7): contador 11-bit de pulsos ABS
- *   - 0xDA0 adicionado: "ABS vivo" exigido pelo cluster PQ35
- *   - Counter 0x1A0 e 0x5A0: sempre incrementa (evita duplicatas que causam rejeição)
- *   - OBD2 timeout: 500ms → 1000ms
- *   - Serial log: 1s → 2s (evita bloqueio coincidindo com timer do 0x1A0)
- *
- * v9 - Freio via CAN (sem fio extra):
- *   - Lê Motor_2 (0x288) byte2 bit0 = Bremslichtschalter (fonte: vw_golf_mk4.dbc)
- *   - Reflete estado do freio em 0x1A0 byte1 bit3 e 0x289 byte1 bit1
- *   - Filtros hardware: RXB0→0x7E9 (OBD2), RXB1→0x288 (Motor_2)
- *   - ACAN2515 v2.1.5: begin() com 2 máscaras + 4 filtros (range obrigatório: 3-6)
- */
-
 #include <SPI.h>
 #include <ACAN2515.h>
 
-// ===================== CONFIGURAÇÃO DE PINOS =====================
+// ===================== CONFIGURACAO DE PINOS =====================
 
 static const uint8_t PIN_CAN_CS   = 5;
 static const uint8_t PIN_CAN_INT  = 2;
@@ -37,41 +11,42 @@ static const uint8_t PIN_SPI_MOSI = 23;
 
 static const uint32_t QUARTZ_FREQUENCY = 8UL * 1000UL * 1000UL;
 
-// ===================== CONFIGURAÇÃO DO PROTOCOLO =====================
+// ===================== CONFIGURACAO DO PROTOCOLO =====================
 
 #define OBD2_REQUEST_ID   0x7E1
 #define OBD2_RESPONSE_ID  0x7E9
-#define MOTOR2_ID         0x288   // Motor_2: Bremslichtschalter byte2 bit0
+#define MOTOR2_ID         0x288   // Motor_2: Bremslichtschalter byte2 bits 0-1
 #define OBD2_INTERVAL     80
 
 #define INTERVALO_1A0  10
 #define INTERVALO_4A0  10
+#define INTERVALO_4A8  10   // Bremse_4: mesma cadencia das outras mensagens de roda
 #define INTERVALO_5A0  20
 #define INTERVALO_DA0  20
 #define INTERVALO_289  20
 
-#define MAX_ACEL    50.0f
-#define MAX_DESACEL 50.0f
-#define OBD2_TIMEOUT      1000
-#define SPEED_DEADZONE    3.0f
+#define MAX_ACEL       50.0f
+#define MAX_DESACEL    50.0f
+#define OBD2_TIMEOUT   1000
+#define SPEED_DEADZONE  3.0f
 #define HEALTH_CHECK_INTERVAL  2000
 
-// Distance Impulse Number (VCDS coding, módulo 17 - Instruments)
-// Fórmula: 43 dentes × (1.000.000 / circunferência_de_rolagem_mm)
-// Opção 1 = 22188 (circ ~1938mm)
-// Opção 2 = 22076 (circ ~1948mm)
-// Opção 3 = 21960 (circ ~1958mm) ← DEFAULT 205/55R16
-// Opção 4 = 21848 (circ ~1968mm)
-// Opção 5 = 22304 (circ ~1928mm)
-// Opção 6 = 22420 (circ ~1918mm)
-// Opção 7 = 22532 (circ ~1908mm)
-#define VCDS_WEGIMPULS  21960.0f  // <- Altere para o número lido no VCDS do seu carro
+// Distance Impulse Number (VCDS coding, modulo 17 - Instruments)
+// Formula: 43 dentes x (1.000.000 / circunferencia_de_rolagem_mm)
+// Opcao 1 = 22188 (circ ~1938mm)
+// Opcao 2 = 22076 (circ ~1948mm)
+// Opcao 3 = 21960 (circ ~1958mm) <- DEFAULT 205/55R16
+// Opcao 4 = 21848 (circ ~1968mm)
+// Opcao 5 = 22304 (circ ~1928mm)
+// Opcao 6 = 22420 (circ ~1918mm)
+// Opcao 7 = 22532 (circ ~1908mm)
+#define VCDS_WEGIMPULS  21960.0f  // <- Altere para o numero lido no VCDS do seu carro
 
 // ===================== OBJETO CAN =====================
 
 ACAN2515 can(PIN_CAN_CS, SPI, PIN_CAN_INT);
 
-// ===================== VARIÁVEIS =====================
+// ===================== VARIAVEIS =====================
 
 bool canOk      = false;
 bool freioAtivo = false;  // lido do Motor_2 (0x288) via CAN
@@ -89,8 +64,8 @@ float    wegimpulsAcum    = 0.0f;
 uint16_t wegimpulsCounter = 0;
 unsigned long tUltimoFrame5A0 = 0;
 
-unsigned long tEnvio1A0 = 0, tEnvio4A0 = 0, tEnvio5A0 = 0;
-unsigned long tEnvioDA0 = 0, tEnvio289 = 0;
+unsigned long tEnvio1A0 = 0, tEnvio4A0 = 0, tEnvio4A8 = 0;
+unsigned long tEnvio5A0 = 0, tEnvioDA0 = 0, tEnvio289 = 0;
 unsigned long tOBD2Req  = 0, tLog = 0, tHealthCheck = 0;
 
 uint32_t errTx = 0, errBusOff = 0, okTx = 0, leituraOBD2 = 0;
@@ -126,22 +101,23 @@ static uint16_t iniciarCAN() {
   settings.mTransmitBuffer1Size = 0;
   settings.mTransmitBuffer2Size = 0;
 
-  // RXB0 (RXM0): 0x7E9
-  // RXB1 (RXM1): 0x288
+  // MCP2515 tem 2 buffers de RX com mascaras independentes:
+  // RXB0 (RXM0): 0x7E9 - resposta OBD2 da TCU
+  // RXB1 (RXM1): 0x288 - Motor_2 (estado do pedal de freio)
+  // ACAN2515 v2.1.5 exige 3-6 filtros ao usar 2 mascaras
   const ACAN2515Mask rxm0 = standard2515Mask(0x7FF, 0, 0);
   const ACAN2515Mask rxm1 = standard2515Mask(0x7FF, 0, 0);
-
   const ACAN2515AcceptanceFilter filters[] = {
     {standard2515Filter(OBD2_RESPONSE_ID, 0, 0), NULL},
     {standard2515Filter(OBD2_RESPONSE_ID, 0, 0), NULL},
-    {standard2515Filter(MOTOR2_ID, 0, 0), NULL},
-    {standard2515Filter(MOTOR2_ID, 0, 0), NULL},
+    {standard2515Filter(MOTOR2_ID,        0, 0), NULL},
+    {standard2515Filter(MOTOR2_ID,        0, 0), NULL},
   };
 
   return can.begin(settings, [] { can.isr(); }, rxm0, rxm1, filters, 4);
 }
 
-// ===================== SAÚDE DO MCP2515 =====================
+// ===================== SAUDE DO MCP2515 =====================
 
 void verificarSaudeMCP() {
   unsigned long agora = millis();
@@ -153,14 +129,9 @@ void verificarSaudeMCP() {
     Serial.println("[ERRO] BUS-OFF - Reinicializando MCP2515...");
     can.end();
     delay(10);
-
     uint16_t err = iniciarCAN();
-    if (err == 0) {
-      Serial.println("[OK] MCP2515 reinicializado");
-    } else {
-      Serial.printf("[ERRO] Falha reinit: 0x%X\n", err);
-      canOk = false;
-    }
+    if (err == 0) Serial.println("[OK] MCP2515 reinicializado");
+    else { Serial.printf("[ERRO] Falha reinit: 0x%X\n", err); canOk = false; }
   }
 }
 
@@ -176,7 +147,6 @@ void atualizarVelocidade() {
 
   float erro  = velAlvo - velCache;
   float passo = erro * (dt * 10.0f);
-
   if (passo >  MAX_ACEL    * dt) passo =  MAX_ACEL    * dt;
   if (passo < -MAX_DESACEL * dt) passo = -MAX_DESACEL * dt;
 
@@ -206,7 +176,7 @@ void lerCAN() {
     }
 
     if (frame.id == MOTOR2_ID) {
-      freioAtivo = (frame.data[2] & 0x01) != 0;
+      freioAtivo = (frame.data[2] & 0x03) != 0;
     }
   }
 }
@@ -215,7 +185,7 @@ void lerCAN() {
 
 void enviarBremse1(float speedKmh) {
   uint16_t speedRaw  = (uint16_t)(speedKmh * 100.0f);
-  uint8_t  brakeFlag = freioAtivo ? 0x08 : 0x00;
+  uint8_t  brakeFlag = freioAtivo ? 0x18 : 0x00;
 
   uint8_t data[8] = {
     0x00,
@@ -225,7 +195,6 @@ void enviarBremse1(float speedKmh) {
     0xFE, 0xFE, 0x00,
     (uint8_t)((counter1A0 & 0x0F) | 0x10)
   };
-
   data[0] = calcChecksum(data, 0x1A0);
   enviarCAN(0x1A0, data);
   counter1A0 = (counter1A0 + 1) & 0x0F;
@@ -233,13 +202,20 @@ void enviarBremse1(float speedKmh) {
 
 void enviarBremse3(float speedKmh) {
   if (speedKmh > 326.0f) speedKmh = 326.0f;
-
   uint16_t val = ((uint16_t)(speedKmh * 100.0f) << 1) & 0xFFFE;
-  uint8_t lo = val & 0xFF;
-  uint8_t hi = (val >> 8) & 0xFF;
+  uint8_t lo = val & 0xFF, hi = (val >> 8) & 0xFF;
   uint8_t data[8] = { lo, hi, lo, hi, lo, hi, lo, hi };
-
   enviarCAN(0x4A0, data);
+}
+
+void enviarBremse4() {
+  uint8_t data[8] = {
+    0x00, 0x80,
+    freioAtivo ? 0x40 : 0x00,
+    freioAtivo ? 0x80 : 0x00,
+    0x00, 0x00, 0x00, 0x00
+  };
+  enviarCAN(0x4A8, data);
 }
 
 void enviarBremse2(float speedKmh) {
@@ -268,7 +244,6 @@ void enviarBremse2(float speedKmh) {
     (uint8_t)(wegimpulsCounter & 0xFF),
     (uint8_t)((wegimpulsCounter >> 8) & 0x07)
   };
-
   enviarCAN(0x5A0, data);
   counter5A0 = (counter5A0 + 1) & 0x0F;
 }
@@ -279,7 +254,6 @@ void enviarDA0() {
     (uint8_t)(counterDA0 & 0xFF),
     (uint8_t)((counterDA0 >> 8) & 0xFF)
   };
-
   enviarCAN(0xDA0, data);
   counterDA0++;
 }
@@ -287,16 +261,15 @@ void enviarDA0() {
 void enviarBremse5() {
   uint8_t b1 = 0x01;
   if (freioAtivo) b1 |= 0x02;
-
   uint8_t data[8] = { 0x00, b1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   enviarCAN(0x289, data);
 }
 
 void enviarTodasABS(float speedKmh) {
   unsigned long agora = millis();
-
   if (agora - tEnvio1A0 >= INTERVALO_1A0) { enviarBremse1(speedKmh); tEnvio1A0 = agora; }
   if (agora - tEnvio4A0 >= INTERVALO_4A0) { enviarBremse3(speedKmh); tEnvio4A0 = agora; }
+  if (agora - tEnvio4A8 >= INTERVALO_4A8) { enviarBremse4();         tEnvio4A8 = agora; }
   if (agora - tEnvio5A0 >= INTERVALO_5A0) { enviarBremse2(speedKmh); tEnvio5A0 = agora; }
   if (agora - tEnvioDA0 >= INTERVALO_DA0) { enviarDA0();             tEnvioDA0 = agora; }
   if (agora - tEnvio289 >= INTERVALO_289) { enviarBremse5();         tEnvio289 = agora; }
@@ -307,8 +280,8 @@ void enviarTodasABS(float speedKmh) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("VW Jetta 2009 - ABS Bypass v9");
-  Serial.println("Freio via CAN (0x288), filtros duplos, sem fio extra");
+  Serial.println("VW Jetta 2009 - ABS Bypass v9.0");
+  Serial.println("Dual brake switch | brake flag 0x18 | Bremse_4 (0x4A8)");
 
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
@@ -325,10 +298,11 @@ void setup() {
   tUltimaLeitura  = agora;
   tUltimoFrame5A0 = agora;
   tEnvio1A0       = agora;
-  tEnvio4A0       = agora + 5;
-  tEnvio5A0       = agora + 3;
-  tEnvioDA0       = agora + 7;
-  tEnvio289       = agora + 9;
+  tEnvio4A0       = agora + 3;
+  tEnvio4A8       = agora + 5;
+  tEnvio5A0       = agora + 7;
+  tEnvioDA0       = agora + 9;
+  tEnvio289       = agora + 11;
 }
 
 void loop() {
@@ -357,7 +331,7 @@ void loop() {
   verificarSaudeMCP();
 
   if (agora - tLog >= 2000) {
-    Serial.printf("[v9] vel=%.1f freio=%d weg=%u obd=%lums reads=%u txOk=%u txErr=%u busOff=%u\n",
+    Serial.printf("[v9.0] vel=%.1f freio=%d weg=%u obd=%lums reads=%u txOk=%u txErr=%u busOff=%u\n",
       velCache, (int)freioAtivo, wegimpulsCounter,
       agora - tUltimaLeitura,
       leituraOBD2, okTx, errTx, errBusOff);
