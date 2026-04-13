@@ -1,249 +1,195 @@
-# PQ35 ABS Module Emulator
+# PQ35 ABS Emulator
 
-> 🇧🇷 [Leia em Português](README.pt-BR.md)
+Emulador de módulo ABS para a plataforma **VW PQ35** (Jetta, Golf, Passat, Tiguan, etc.) usando um **ESP32 + MCP2515 (TJA1050)**. Lê a velocidade da TCU via OBD2 e injeta as mensagens ABS na rede CAN, permitindo que o cluster, o hodômetro e o Cruise Control funcionem normalmente sem o módulo ABS original.
 
-**ESP32 + MCP2515** emulator for the ABS module on **Volkswagen PQ35 platform vehicles** (Jetta MK5, Golf MK5, Passat B6, Audi A3 8P, Seat Leon MK2).
+> **Testado em:** VW Jetta 2.5 2009 — câmbio automático 09G — cluster PQ35
 
-Developed and tested on a **VW Jetta 2.5 2009** with a burned-out ABS module (part suffix **AD**).
+***
 
----
+## Hardware necessário
 
-## The Problem
-
-On PQ35 vehicles, the ABS module is responsible for broadcasting the vehicle speed signal on the CAN bus. When the module fails or is removed:
-
-- Speedometer reads zero
-- Odometer stops counting
-- Fuel gauge becomes erratic
-- ABS and ESP warning lights illuminate
-- Gateway (J533) logs fault `00625 — Speed signal, No signal/communication`
-
-This project replaces the faulty ABS module with an ESP32 + MCP2515 that reads the transmission speed from the powertrain CAN bus and re-broadcasts it as the original ABS module would.
-
----
-
-## Important: OBD-II port does NOT work
-
-The PQ35 platform has **three physically separate CAN buses**:
-
-| Bus | Wire colors | What's on it |
-|---|---|---|
-| **Powertrain CAN** | Orange/black (High), Orange/brown (Low) | ECU, TCM, ABS, cluster speed signal |
-| Comfort CAN | — | Body control, doors, windows |
-| Infotainment CAN | — | Radio, navigation |
-
-The OBD-II port only exposes the **diagnostic bus** (gateway J533 pins 9/19), which is a separate channel used by scan tools. **Speed and ABS messages only travel on the Powertrain CAN** — they are never present on the OBD-II connector.
-
-You must tap directly into the powertrain CAN wiring inside the car.
-
----
-
-## Hardware
-
-| Component | Notes |
+| Componente | Observação |
 |---|---|
-| ESP32 DevKit V1 | Any 30 or 38-pin variant |
-| MCP2515 module | With TJA1050 transceiver — 8 MHz or 16 MHz crystal |
-| USB cable | Power and programming |
+| ESP32 (30 pinos) | Qualquer variante com SPI |
+| Módulo MCP2515 + TJA1050 | Cristal de **8 MHz** |
+| Conector OBD2 fêmea | Acesso ao barramento CAN (pinos 6 e 14) |
 
----
+### Pinagem
 
-## Wiring
+| MCP2515 | ESP32 |
+|---|---|
+| CS | GPIO 5 |
+| INT | GPIO 2 |
+| SCK | GPIO 18 |
+| MISO | GPIO 19 |
+| MOSI | GPIO 23 |
+| VCC | **VIN (5V)** |
+| GND | GND |
 
-### ESP32 ↔ MCP2515
+> ⚠️ O TJA1050 exige alimentação entre 4.75–5.25V para gerar níveis diferenciais corretos no barramento CAN. Alimentar pelo **VIN (5V)** é obrigatório — o 3.3V está fora da especificação do transceiver e pode causar perda de frames. O SPI funciona normalmente em 3.3V porque o TJA1050 aceita lógica de entrada a partir de 2.0V.
+
+Conectar `CAN H` e `CAN L` do módulo diretamente ao barramento CAN do carro (OBD2 pinos 6 e 14).
+
+***
+
+## Dependências
+
+| Biblioteca | Versão testada |
+|---|---|
+| [ACAN2515](https://github.com/pierremolinaro/acan2515) por Pierre Molinaro | **2.1.5** |
+
+Instalar pela Arduino IDE: *Ferramentas → Gerenciar Bibliotecas → ACAN2515*
+
+***
+
+## Como funciona
 
 ```
-MCP2515           ESP32 DevKit V1
--------           ---------------
-VCC       →       VIN  (5V — do NOT use the 3.3V pin)
-GND       →       GND
-CS        →       GPIO 5
-SCK       →       GPIO 18
-MOSI      →       GPIO 23
-MISO      →       GPIO 19
-INT       →       GPIO 4
+TCU (câmbio 09G)
+      │  OBD2 PID 0x0D (velocidade)
+      ▼
+   ESP32 + MCP2515
+      │  publica a cada 10/20ms:
+      ├─ 0x1A0  Bremse_1  (velocidade + flag de freio)
+      ├─ 0x4A0  Bremse_3  (4 rodas individuais)
+      ├─ 0x5A0  Bremse_2  (velocidade + Wegimpulse)
+      ├─ 0xDA0  ABS Alive (keepalive do módulo ABS)
+      └─ 0x289  Bremse_5  (habilita Cruise Control)
+
+ECU Motor (Motor_2 0x288)
+      │  byte2 bit0 = Bremslichtschalter
+      ▼
+   ESP32 lê o estado do freio e reflete nos frames acima
 ```
 
-> **Important:** Power the MCP2515 from the ESP32 **VIN** pin (5V from USB), not from the 3.3V pin. The TJA1050 transceiver is rated for 5V — running it at 3.3V causes unstable CAN communication.
+### Mensagens transmitidas
 
-### MCP2515 ↔ Vehicle powertrain CAN bus
-
-```
-MCP2515 CANH  →  Powertrain CAN High (orange/black wire — B383)
-MCP2515 CANL  →  Powertrain CAN Low  (orange/brown wire — B390)
-```
-
-The easiest access point confirmed on the Jetta 2.5 2009 is directly at the **gateway J533 connector** (located in the driver's footwell, behind the dashboard):
-
-| Gateway J533 pin | Signal | Wire color |
-|---|---|---|
-| Pin 16 | Powertrain CAN High | Orange/black |
-| Pin 6  | Powertrain CAN Low  | Orange/brown |
-
-Alternatively, tap the same twisted pair at the **ABS module connector** or anywhere along the powertrain CAN harness.
-
-> **Do not use the OBD-II port.** The powertrain CAN bus is not routed there. Connecting via OBD-II will result in no data being received or transmitted.
-
----
-
-## CAN Messages
-
-### Transmitted (emulator → bus)
-
-| ID | VAG name | Function | Rate |
+| ID | Nome | Intervalo | Função |
 |---|---|---|---|
-| `0x5A0` | Bremse_2 | Speedometer + distance counter | 10 ms |
-| `0x1A0` | Bremse_1 | Wheel speed (read by ECU, TCM) | 10 ms |
-| `0x4A0` | Bremse_3 | ABS/ESP module keepalive | 50 ms |
+| `0x1A0` | Bremse_1 | 10 ms | Velocidade principal + flag de freio |
+| `0x4A0` | Bremse_3 | 10 ms | Velocidade das 4 rodas individualmente |
+| `0x5A0` | Bremse_2 | 20 ms | Velocidade média + contador de pulsos ABS |
+| `0xDA0` | ABS Alive | 20 ms | Keepalive do módulo ABS para o cluster |
+| `0x289` | Bremse_5 | 20 ms | Sinalização ESP/freio para o Cruise Control |
 
-### Received (bus → emulator)
+### Mensagens recebidas
 
-| ID | VAG name | Function |
+| ID | Nome | Dado lido |
 |---|---|---|
-| `0x540` | Getriebe_2 | Transmission output speed (sent by TCM) |
+| `0x7E9` | OBD2 TCU | Velocidade em km/h (PID 0x0D) |
+| `0x288` | Motor_2 | Byte 2 bit 0 = pedal de freio pressionado |
 
-### Encoding
+***
 
-```
-0x5A0 speed:     raw = km/h × 148  (16-bit, little-endian)
-0x5A0 distance:  50 counts per meter, overflow at 30000
-0x1A0 speed:     raw = km/h × 148  (bytes 1–2)
-```
+## Configuração obrigatória
 
-> The distance counter in `0x5A0` bytes 5–6 **must** be incremented proportionally to speed. Without it, the speedometer needle rises for ~10 seconds and then drops — a well-documented PQ35 behavior, fixed in this implementation.
+### Distance Impulse (hodômetro)
 
----
-
-## Setup
-
-### 1. Install the library
-
-Install **MCP_CAN** by *coryjfowler* via Arduino IDE Library Manager:
-
-```
-Tools → Manage Libraries → search "MCP_CAN" → Install
-```
-
-### 2. Set the crystal frequency
-
-Open the `.ino` file and find:
+Leia o valor no VCDS: *Módulo 17 — Instruments → Codificação*
 
 ```cpp
-CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ)
+#define VCDS_WEGIMPULS  21960.0f  // altere para o valor do seu carro
 ```
 
-- **8 MHz** crystal on your board → `MCP_8MHZ` (default)
-- **16 MHz** crystal on your board → change to `MCP_16MHZ`
+| Opção VCDS | Pulsos/km | Circunferência |
+|---|---|---|
+| 1 | 22188 | ~1938 mm |
+| 2 | 22076 | ~1948 mm |
+| **3 — padrão 205/55R16** | **21960** | **~1958 mm** |
+| 4 | 21848 | ~1968 mm |
+| 5 | 22304 | ~1928 mm |
+| 6 | 22420 | ~1918 mm |
+| 7 | 22532 | ~1908 mm |
 
-To identify your crystal, look for the small oval metal component near the MCP2515 chip. The number engraved on it indicates the frequency (`8.000` = 8 MHz, `16.000` = 16 MHz).
+***
 
-### 3. Upload
+## Detalhes de implementação
 
-Select **ESP32 Dev Module** as the board in Arduino IDE and upload.
+### Interpolação de velocidade
 
----
+A velocidade OBD2 chega em inteiros (km/h) a cada ~80 ms. Um controlador proporcional suaviza a transição:
 
-## Bench Testing
+- Aceleração máxima: **50 km/h/s**
+- Desaceleração máxima: **50 km/h/s**
 
-Without the car connected, the MCP2515 receives no CAN ACK and all transmissions fail with `[TX ERR]`. This is **normal CAN bus behavior** — not a bug.
+### Zona morta — anti-hodômetro fantasma
 
-To test on the bench, enable loopback mode:
+Duas camadas de proteção:
 
-```cpp
-// In setup(), replace:
-CAN.setMode(MCP_NORMAL);
-// With:
-CAN.setMode(MCP_LOOPBACK);
+1. **`lerCAN()`** — se `rawOBD <= 3.0 km/h`, `velAlvo = 0`
+2. **`loop()`** — se `velCache <= 3.0 km/h`, `velEnvio = 0`
+
+### Wegimpulse
+
+O cluster PQ35 exige pulsos de roda acumulados junto com a velocidade no `0x5A0`. Sem eles o cluster detecta "velocidade > 0 mas zero pulsos" e zera o ponteiro.
+
+```
+pulsos/s = speedKmh × VCDS_WEGIMPULS / 3600
+Contador 11-bit (0–2047), faz wrap automaticamente
 ```
 
-In loopback mode the chip ACKs its own frames and the errors disappear. **Switch back to `MCP_NORMAL` before installing in the car.**
+### Leitura do freio via CAN
 
----
+Lido do `Motor_2 (0x288)` byte 2 bit 0, sem nenhum fio extra. Refletido em:
 
-## Speed Calibration
+- `0x1A0` byte 1 bit 3 — flag de freio para o cluster
+- `0x289` byte 1 bit 1 — sinalização de freio para o Cruise Control
 
-The factor `148.0` (defined as `FATOR_VELOCIDADE`) is the documented PQ35 value. If the speedometer reads differently from GPS:
+### Checksum 0x1A0
 
-1. Open Serial Monitor at 115200 baud
-2. Note the `raw=` value while driving at a known speed
-3. Calculate: `FATOR_VELOCIDADE = raw / gps_speed_kmh`
-4. Update the constant and re-upload
+```
+byte0 = XOR(bytes 1–7) XOR (CAN_ID & 0xFF) XOR (CAN_ID >> 8)
+```
 
-An alternative factor reported for some PQ35 transmissions: `322.0`
+***
 
----
+## Monitoramento serial
 
-## VCDS Preparation
+Baud rate: **115200**
 
-Before installing, it is recommended to:
+```
+[v8.1] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
+```
 
-1. **Address 03 (ABS):** Clear any existing faults
-2. **Address 19 (Gateway J533):** In Long Coding Helper, confirm the ABS/ESP module presence bit is **unchecked** if you have already disabled it via VCDS. This prevents the gateway from expecting a UDS diagnostic response from the ABS address.
-3. After installing and starting the car, clear all DTCs with VCDS or OBDeleven.
-
-### What this emulator does and does not fix
-
-| Function | Result |
+| Campo | Significado |
 |---|---|
-| Speedometer | ✅ Working |
-| Odometer | ✅ Working |
-| ABS warning light off | ✅ Clears (no more message timeout) |
-| Fuel gauge stabilizes | ✅ Improves |
-| Appears in VCDS autoscan as ABS module | ❌ No (no UDS diagnostic response) |
-| Fault `01316` cleared from gateway | ⚠️ Depends on gateway long coding |
+| `vel` | Velocidade enviada ao painel (km/h) |
+| `freio` | Estado do pedal (`0` = solto, `1` = pressionado) |
+| `weg` | Contador Wegimpulse (0–2047) |
+| `obd` | Tempo desde a última resposta OBD2 (ms) |
+| `reads` | Total de leituras OBD2 |
+| `txOk` / `txErr` | Frames enviados com sucesso / com erro |
+| `busOff` | Reinicializações por BUS-OFF |
 
----
+***
 
-## Code Structure
+## Histórico de versões
 
-```
-pq35_abs_emulator.ino
-│
-├── setup()             — initializes MCP2515, configures RX filters
-├── loop()              — controls transmission timing
-│
-├── lerCAN()            — reads 0x540 from TCM, extracts speed
-├── verificarTimeout()  — zeroes speed if TCM stops transmitting
-│
-├── enviar5A0()         — transmits speedometer + distance counter
-├── enviar1A0()         — transmits wheel speed for ECU/TCM
-└── enviar4A0()         — transmits ABS/ESP keepalive
-```
+### v8.1
+- Freio lido do `Motor_2 (0x288)` via CAN — sem fio extra
+- Estado do freio refletido em `0x1A0` e `0x289`
+- Filtros hardware duplos: `RXB0→0x7E9` / `RXB1→0x288`
+- `iniciarCAN()` centralizado — `setup` e reinit usam o mesmo código
 
----
+### v8.0
+- Fator `0x5A0` corrigido: `73.0 → 100.0`
+- `BR2_Wegimpulse` adicionado nos bytes 6–7 do `0x5A0`
+- `0xDA0` adicionado: keepalive do módulo ABS
+- Counters sempre incrementam
+- Deadzone corrigida: `<` → `<=` e aplicada também no envio
 
-## Compatibility
+***
 
-Tested on VW Jetta 2.5 2009. Should work on any PQ35 platform vehicle:
+## Referências
 
-| Vehicle | Status |
-|---|---|
-| VW Jetta MK5 (2005–2010) | Tested |
-| VW Golf MK5 (2003–2009) | Expected to work |
-| VW Passat B6 (2005–2010) | Expected to work |
-| Audi A3 8P (2003–2012) | Expected to work |
-| Seat Leon MK2 (2005–2012) | Expected to work |
-| Skoda Octavia MK2 (2004–2013) | Expected to work |
+- [The07k Wiki — CAN Bus Emulation for Cruise Control](https://the07k.wiki/wiki/Can-bus_emulation_for_cruise_control)
+- [PQ35/46 KMatrix V5.20.6F](https://opengarages.org) — `BR2_Wegimpulse`, `BR2_mi_Radgeschw`
+- [vw_golf_mk4.dbc — commaai/opendbc](https://github.com/commaai/opendbc) — `Bremslichtschalter`
+- [Hackaday — CAN BUS Gaming Simulator](https://hackaday.io/project/6288) — `0xDA0`
+- [ACAN2515 v2.1.5 — Pierre Molinaro](https://github.com/pierremolinaro/acan2515)
 
-If you test on any of these models, please open an issue with your results.
+***
 
----
+## Licença
 
-## References
-
-- [VW Instrument Cluster Controller — an-ven](https://github.com/an-ven/VW-Instrument-Cluster-Controller) — `0x5A0` formula tested on real hardware
-- [CAN BUS Gaming Simulator — Hackaday](https://hackaday.io/project/6288) — VW PQ35 CAN ID mapping
-- [Vehicle Reverse Engineering Wiki — Volkswagen](https://vehicle-reverse-engineering.fandom.com/wiki/Volkswagen) — real CAN log from VW Passat B6 PQ35
-- [Autosport Labs MK5 CAN Preset](https://www.autosportlabs.com/2006-2010-vw-mk5-can-bus-preset-now-available/) — confirmed wheel speed channels
-
----
-
-## License
-
-MIT — use freely, at your own risk. No warranty of any kind for any specific vehicle.
-
----
-
-## Contributing
-
-Pull requests are welcome. If you tested this on any PQ35 vehicle — successfully or not — please open an issue with your findings, the transmission type (manual/automatic), and the speed calibration factor that worked for you.
+MIT
