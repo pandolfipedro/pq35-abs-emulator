@@ -20,10 +20,8 @@ static const uint32_t QUARTZ_FREQUENCY = 8UL * 1000UL * 1000UL;
 
 #define INTERVALO_1A0  10
 #define INTERVALO_4A0  10
-#define INTERVALO_4A8  10   // Bremse_4: mesma cadencia das outras mensagens de roda
+#define INTERVALO_4A8  10
 #define INTERVALO_5A0  20
-#define INTERVALO_DA0  20
-#define INTERVALO_289  20
 
 #define MAX_ACEL       50.0f
 #define MAX_DESACEL    50.0f
@@ -58,14 +56,13 @@ unsigned long tUltimoCache   = 0;
 
 uint8_t  counter1A0  = 0;    // rolling 4-bit (0-15)
 uint8_t  counter5A0  = 0;    // rolling 4-bit (0-15)
-uint16_t counterDA0  = 0;    // free-running 16-bit
+uint8_t  counter4A8  = 0;    // rolling 4-bit (0-15)
 
 float    wegimpulsAcum    = 0.0f;
 uint16_t wegimpulsCounter = 0;
 unsigned long tUltimoFrame5A0 = 0;
 
-unsigned long tEnvio1A0 = 0, tEnvio4A0 = 0, tEnvio4A8 = 0;
-unsigned long tEnvio5A0 = 0, tEnvioDA0 = 0, tEnvio289 = 0;
+unsigned long tEnvio1A0 = 0, tEnvio4A0 = 0, tEnvio4A8 = 0, tEnvio5A0 = 0;
 unsigned long tOBD2Req  = 0, tLog = 0, tHealthCheck = 0;
 
 uint32_t errTx = 0, errBusOff = 0, okTx = 0, leituraOBD2 = 0;
@@ -170,7 +167,12 @@ void lerCAN() {
     if (frame.id == OBD2_RESPONSE_ID &&
         frame.data[1] == 0x41 && frame.data[2] == 0x0D) {
       float raw = (float)frame.data[3];
-      velAlvo = (raw <= SPEED_DEADZONE) ? 0.0f : raw;
+      // Ignorar leituras anomalas (0xFF) quando a TCU esta desligada
+      if (raw >= 254.0f) {
+        velAlvo = 0.0f;
+      } else {
+        velAlvo = (raw <= SPEED_DEADZONE) ? 0.0f : raw;
+      }
       tUltimaLeitura = millis();
       leituraOBD2++;
     }
@@ -189,11 +191,11 @@ void enviarBremse1(float speedKmh) {
 
   uint8_t data[8] = {
     0x00,
-    brakeFlag,
+    0x00, // IMPORTANTE: NUNCA usar brakeFlag aqui. Qualquer bit invalida Bremse_1 na rede e o velocimetro cai pra 0!
     (uint8_t)((speedRaw & 0x7F) << 1),
     (uint8_t)((speedRaw >> 7) & 0xFF),
     0xFE, 0xFE, 0x00,
-    (uint8_t)((counter1A0 & 0x0F) | 0x10)
+    (uint8_t)((counter1A0 & 0x0F) | 0x50) // Bit 4="ASR_ESP verbaut", Bit 6="Sta_ESP gultig"
   };
   data[0] = calcChecksum(data, 0x1A0);
   enviarCAN(0x1A0, data);
@@ -209,19 +211,29 @@ void enviarBremse3(float speedKmh) {
 }
 
 void enviarBremse4() {
+  uint16_t press = freioAtivo ? 0x0400 : 0x0000;
   uint8_t data[8] = {
-    0x00, 0x80,
-    freioAtivo ? 0x40 : 0x00,
-    freioAtivo ? 0x80 : 0x00,
-    0x00, 0x00, 0x00, 0x00
+    0x00, 
+    0x40, // BR5_Sta_Gierrate = 1 (valid)
+    (uint8_t)(press & 0xFF),
+    (uint8_t)((press >> 8) | 0x20), // BR5_Druckgueltig = 1
+    0x00,
+    (uint8_t)(freioAtivo ? 0x08 : 0x00), // BR5_Bremslicht
+    (uint8_t)((counter4A8 & 0x0F) << 4), // BR5_Zaehler
+    0x00
   };
+  uint8_t chk = 0;
+  for (int i = 0; i < 7; i++) chk ^= data[i];
+  chk ^= 0xA8; chk ^= 0x04;
+  data[7] = chk; // BR5_Checksumme
   enviarCAN(0x4A8, data);
+  counter4A8 = (counter4A8 + 1) & 0x0F;
 }
 
 void enviarBremse2(float speedKmh) {
   unsigned long agora = millis();
   float dt = (agora - tUltimoFrame5A0) / 1000.0f;
-  if (dt <= 0.0f || dt > 0.5f) dt = 0.020f;
+  if (dt < 0.010f || dt > 0.030f) dt = 0.020f;
   tUltimoFrame5A0 = agora;
 
   if (speedKmh > 326.0f) speedKmh = 326.0f;
@@ -235,12 +247,12 @@ void enviarBremse2(float speedKmh) {
   wegimpulsCounter = (wegimpulsCounter + novos) & 0x07FF;
 
   uint8_t data[8] = {
-    0x00,
+    0x00, // BR2_Querbeschl = 0
     (uint8_t)(vel & 0xFF),
     (uint8_t)((vel >> 8) & 0xFF),
-    (uint8_t)(ts & 0xFF),
-    (uint8_t)((ts >> 8) & 0xFF),
-    (uint8_t)(counter5A0 & 0x0F),
+    (uint8_t)(0x05 | (counter5A0 << 4)), // BR2_Lampe_ABS=1, BR2_Lampe_BK=1, BR2_Zaehler
+    0x00,
+    0x00,
     (uint8_t)(wegimpulsCounter & 0xFF),
     (uint8_t)((wegimpulsCounter >> 8) & 0x07)
   };
@@ -248,31 +260,13 @@ void enviarBremse2(float speedKmh) {
   counter5A0 = (counter5A0 + 1) & 0x0F;
 }
 
-void enviarDA0() {
-  uint8_t data[8] = {
-    0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
-    (uint8_t)(counterDA0 & 0xFF),
-    (uint8_t)((counterDA0 >> 8) & 0xFF)
-  };
-  enviarCAN(0xDA0, data);
-  counterDA0++;
-}
-
-void enviarBremse5() {
-  uint8_t b1 = 0x01;
-  if (freioAtivo) b1 |= 0x02;
-  uint8_t data[8] = { 0x00, b1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  enviarCAN(0x289, data);
-}
-
+// (Funcoes DA0 e 289 Removidas permanentemente para prevencao de Diagnosticos / Lixo de Rede MQB)
 void enviarTodasABS(float speedKmh) {
   unsigned long agora = millis();
   if (agora - tEnvio1A0 >= INTERVALO_1A0) { enviarBremse1(speedKmh); tEnvio1A0 = agora; }
   if (agora - tEnvio4A0 >= INTERVALO_4A0) { enviarBremse3(speedKmh); tEnvio4A0 = agora; }
   if (agora - tEnvio4A8 >= INTERVALO_4A8) { enviarBremse4();         tEnvio4A8 = agora; }
   if (agora - tEnvio5A0 >= INTERVALO_5A0) { enviarBremse2(speedKmh); tEnvio5A0 = agora; }
-  if (agora - tEnvioDA0 >= INTERVALO_DA0) { enviarDA0();             tEnvioDA0 = agora; }
-  if (agora - tEnvio289 >= INTERVALO_289) { enviarBremse5();         tEnvio289 = agora; }
 }
 
 // ===================== SETUP & LOOP =====================
@@ -280,8 +274,8 @@ void enviarTodasABS(float speedKmh) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("VW Jetta 2009 - ABS Bypass v9.0");
-  Serial.println("Dual brake switch | brake flag 0x18 | Bremse_4 (0x4A8)");
+  Serial.println("VW Jetta 2009 - ABS Bypass vFINAL (100% Oficial K-Matrix)");
+  Serial.println("Bremse_1(1A0), Bremse_2(5A0), Bremse_3(4A0), Bremse_5(4A8)");
 
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
@@ -301,8 +295,6 @@ void setup() {
   tEnvio4A0       = agora + 3;
   tEnvio4A8       = agora + 5;
   tEnvio5A0       = agora + 7;
-  tEnvioDA0       = agora + 9;
-  tEnvio289       = agora + 11;
 }
 
 void loop() {
@@ -331,10 +323,12 @@ void loop() {
   verificarSaudeMCP();
 
   if (agora - tLog >= 2000) {
-    Serial.printf("[v9.0] vel=%.1f freio=%d weg=%u obd=%lums reads=%u txOk=%u txErr=%u busOff=%u\n",
-      velCache, (int)freioAtivo, wegimpulsCounter,
-      agora - tUltimaLeitura,
-      leituraOBD2, okTx, errTx, errBusOff);
+    if (errTx > 0 || errBusOff > 0) {
+      Serial.printf("[vFINAL] vel=%.1f freio=%d | ERRO CAN: txErr=%u busOff=%u\n",
+        velCache, (int)freioAtivo, errTx, errBusOff);
+    } else {
+      Serial.printf("[vFINAL] vel=%.1f freio=%d\n", velCache, (int)freioAtivo);
+    }
     tLog = agora;
   }
 }
