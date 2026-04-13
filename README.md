@@ -1,6 +1,6 @@
 # PQ35 ABS Emulator
 
-Emulador de módulo ABS para a plataforma **VW PQ35** (Jetta, Golf, Passat, Tiguan, etc.) usando um **ESP32 + MCP2515 (TJA1050)**. Lê a velocidade da TCU via OBD2 e injeta as mensagens ABS na rede CAN, permitindo que o cluster, o hodômetro e o Cruise Control funcionem normalmente sem o módulo ABS original.
+Emulador de módulo ABS para a plataforma **VW PQ35** usando um **ESP32 + MCP2515 (TJA1050)**. Lê a velocidade da TCU via OBD2 e injeta as mensagens ABS na rede CAN, permitindo que o cluster, o hodômetro e o Cruise Control funcionem normalmente sem o módulo ABS original.
 
 > **Testado em:** VW Jetta 2.5 2009 — câmbio automático 09G — cluster PQ35
 
@@ -26,9 +26,9 @@ Emulador de módulo ABS para a plataforma **VW PQ35** (Jetta, Golf, Passat, Tigu
 | VCC | **VIN (5V)** |
 | GND | GND |
 
-> ⚠️ O TJA1050 exige alimentação entre 4.75–5.25V para gerar níveis diferenciais corretos no barramento CAN. Alimentar pelo **VIN (5V)** é obrigatório — o 3.3V está fora da especificação do transceiver e pode causar perda de frames. O SPI funciona normalmente em 3.3V porque o TJA1050 aceita lógica de entrada a partir de 2.0V.
+> ⚠️ O TJA1050 exige alimentação entre 4.75–5.25V. Alimentar pelo **VIN (5V)** é obrigatório — o 3.3V está fora da especificação do transceiver e pode causar perda de frames. O SPI funciona normalmente em 3.3V pois o TJA1050 aceita lógica de entrada a partir de 2.0V.
 
-Conectar `CAN H` e `CAN L` do módulo diretamente ao barramento CAN do carro (OBD2 pinos 6 e 14).
+Conectar `CAN H` e `CAN L` diretamente ao barramento CAN do carro (OBD2 pinos 6 e 14).
 
 ***
 
@@ -52,12 +52,13 @@ TCU (câmbio 09G)
       │  publica a cada 10/20ms:
       ├─ 0x1A0  Bremse_1  (velocidade + flag de freio)
       ├─ 0x4A0  Bremse_3  (4 rodas individuais)
+      ├─ 0x4A8  Bremse_4  (pressão hidráulica de frenagem)
       ├─ 0x5A0  Bremse_2  (velocidade + Wegimpulse)
       ├─ 0xDA0  ABS Alive (keepalive do módulo ABS)
       └─ 0x289  Bremse_5  (habilita Cruise Control)
 
 ECU Motor (Motor_2 0x288)
-      │  byte2 bit0 = Bremslichtschalter
+      │  byte2 bits 0-1 = dual brake switch
       ▼
    ESP32 lê o estado do freio e reflete nos frames acima
 ```
@@ -68,6 +69,7 @@ ECU Motor (Motor_2 0x288)
 |---|---|---|---|
 | `0x1A0` | Bremse_1 | 10 ms | Velocidade principal + flag de freio |
 | `0x4A0` | Bremse_3 | 10 ms | Velocidade das 4 rodas individualmente |
+| `0x4A8` | Bremse_4 | 10 ms | Pressão hidráulica simulada de frenagem |
 | `0x5A0` | Bremse_2 | 20 ms | Velocidade média + contador de pulsos ABS |
 | `0xDA0` | ABS Alive | 20 ms | Keepalive do módulo ABS para o cluster |
 | `0x289` | Bremse_5 | 20 ms | Sinalização ESP/freio para o Cruise Control |
@@ -77,7 +79,11 @@ ECU Motor (Motor_2 0x288)
 | ID | Nome | Dado lido |
 |---|---|---|
 | `0x7E9` | OBD2 TCU | Velocidade em km/h (PID 0x0D) |
-| `0x288` | Motor_2 | Byte 2 bit 0 = pedal de freio pressionado |
+| `0x288` | Motor_2 | Byte 2 bits 0-1 = dual brake switch |
+
+Os filtros são aplicados em **hardware** no MCP2515 (RXB0 → `0x7E9`, RXB1 → `0x288`), sem sobrecarregar o buffer.
+
+> ⚠️ O `0x3D0` (Immobilizer) **não é transmitido** — a ECU do motor já envia este ID no barramento. Duplicar causaria conflito de arbitragem CAN.
 
 ***
 
@@ -107,21 +113,21 @@ Leia o valor no VCDS: *Módulo 17 — Instruments → Codificação*
 
 ### Interpolação de velocidade
 
-A velocidade OBD2 chega em inteiros (km/h) a cada ~80 ms. Um controlador proporcional suaviza a transição:
+A velocidade OBD2 chega em inteiros (km/h) a cada ~80 ms. Um controlador proporcional suaviza a transição para que o painel nunca veja saltos:
 
 - Aceleração máxima: **50 km/h/s**
 - Desaceleração máxima: **50 km/h/s**
 
 ### Zona morta — anti-hodômetro fantasma
 
-Duas camadas de proteção:
+Duas camadas de proteção contra acúmulo de distância com o carro parado:
 
 1. **`lerCAN()`** — se `rawOBD <= 3.0 km/h`, `velAlvo = 0`
 2. **`loop()`** — se `velCache <= 3.0 km/h`, `velEnvio = 0`
 
-### Wegimpulse
+### Wegimpulse (BR2_Wegimpulse)
 
-O cluster PQ35 exige pulsos de roda acumulados junto com a velocidade no `0x5A0`. Sem eles o cluster detecta "velocidade > 0 mas zero pulsos" e zera o ponteiro.
+O cluster PQ35 exige pulsos de roda acumulados no `0x5A0`. Sem eles detecta "velocidade > 0 mas zero pulsos" e zera o ponteiro.
 
 ```
 pulsos/s = speedKmh × VCDS_WEGIMPULS / 3600
@@ -130,10 +136,10 @@ Contador 11-bit (0–2047), faz wrap automaticamente
 
 ### Leitura do freio via CAN
 
-Lido do `Motor_2 (0x288)` byte 2 bit 0, sem nenhum fio extra. Refletido em:
+O VW usa **dois switches de freio** que ativam em momentos distintos do curso do pedal. Sequência real ao frear: `00→01→03→02→00`. O estado é lido do `0x288` byte 2 bits 0-1 sem nenhum fio extra, e refletido em:
 
-- `0x1A0` byte 1 bit 3 — flag de freio para o cluster
-- `0x289` byte 1 bit 1 — sinalização de freio para o Cruise Control
+- `0x1A0` byte 1 = `0x18` (bits 3+4) quando freado
+- `0x289` byte 1 bit 1 = freio ativo (desengata Cruise Control)
 
 ### Checksum 0x1A0
 
@@ -148,7 +154,7 @@ byte0 = XOR(bytes 1–7) XOR (CAN_ID & 0xFF) XOR (CAN_ID >> 8)
 Baud rate: **115200**
 
 ```
-[v9] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
+[v9.0] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
 ```
 
 | Campo | Significado |
@@ -165,27 +171,33 @@ Baud rate: **115200**
 
 ## Histórico de versões
 
- v8 - Correções críticas:
- *   - 0x5A0 fator corrigido: 73.0 → 100.0 (igual 0x1A0/0x4A0, fonte: KMatrix oficial)
- *   - 0x5A0 BR2_Wegimpulse adicionado (bytes 6-7): contador 11-bit de pulsos ABS
- *   - 0xDA0 adicionado: "ABS vivo" exigido pelo cluster PQ35
- *   - Counter 0x1A0 e 0x5A0: sempre incrementa (evita duplicatas que causam rejeição)
- *   - OBD2 timeout: 500ms → 1000ms
- *   - Serial log: 1s → 2s (evita bloqueio coincidindo com timer do 0x1A0)
+### v9.0
+- Dual brake switch: `(byte2 & 0x03)` ao invés de bit0 apenas (sequência `00→01→03→02→00`)
+- `0x1A0` brake flag corrigido: `0x08` → `0x18` (bits 3+4)
+- `0x4A8` Bremse_4 adicionado: pressão hidráulica simulada de frenagem
+- `0x3D0` removido: não enviar Immobilizer quando ECU original está presente
 
- v9 - Freio via CAN (sem fio extra):
- *   - Lê Motor_2 (0x288) byte2 bit0 = Bremslichtschalter (fonte: vw_golf_mk4.dbc)
- *   - Reflete estado do freio em 0x1A0 byte1 bit3 e 0x289 byte1 bit1
- *   - Filtros hardware: RXB0→0x7E9 (OBD2), RXB1→0x288 (Motor_2)
- *   - ACAN2515 v2.1.5: begin() com 2 máscaras + 4 filtros (range obrigatório: 3-6)
+### v8.1
+- Freio lido do `Motor_2 (0x288)` via CAN — sem fio extra
+- Filtros hardware duplos: `RXB0→0x7E9` / `RXB1→0x288`
+- `iniciarCAN()` centralizado — `setup` e reinit usam o mesmo código
+
+### v8.0
+- Fator `0x5A0` corrigido: `73.0 → 100.0`
+- `BR2_Wegimpulse` adicionado nos bytes 6–7 do `0x5A0`
+- `0xDA0` adicionado: keepalive do módulo ABS
+- Counters sempre incrementam
+- Deadzone: `<` → `<=` e aplicada também no envio
+
 ***
 
 ## Referências
 
 - [The07k Wiki — CAN Bus Emulation for Cruise Control](https://the07k.wiki/wiki/Can-bus_emulation_for_cruise_control)
 - [PQ35/46 KMatrix V5.20.6F](https://opengarages.org) — `BR2_Wegimpulse`, `BR2_mi_Radgeschw`
-- [vw_golf_mk4.dbc — commaai/opendbc](https://github.com/commaai/opendbc) — `Bremslichtschalter`
-- [Hackaday — CAN BUS Gaming Simulator](https://hackaday.io/project/6288) — `0xDA0`
+- [vw_golf_mk4.dbc — commaai/opendbc](https://github.com/commaai/opendbc) — `Bremslichtschalter` (`0x288`)
+- [OpenStreetMap Wiki — VW-CAN](https://wiki.openstreetmap.org/wiki/VW-CAN) — dual brake switch, `0x1A0` flag `0x18`, `0x4A8`
+- [Hackaday — CAN BUS Gaming Simulator v3.0](https://hackaday.io/project/6288) — `0xDA0` ABS Alive
 - [ACAN2515 v2.1.5 — Pierre Molinaro](https://github.com/pierremolinaro/acan2515)
 
 ***
