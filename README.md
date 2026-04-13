@@ -20,7 +20,7 @@ Ao remover ou isolar o módulo defeituoso, o barramento CAN perde as mensagens q
 - Painel com luzes de ABS, Brake e Traction Control ativas de forma permanente
 - **Cruise Control bloqueado** pela ECU do motor, que requer a presença de um nó ABS/ESP saudável no barramento para liberar o sistema
 
-Este projeto substitui o MK60EC1 no barramento CAN. Ele lê a velocidade real da TCU (câmbio 09G) via protocolo OBD2 e reconstrói todas as mensagens que o ABS original enviaria, tornando o comportamento do veículo indistinguível do estado funcional original.
+Este projeto substitui o MK60EC1 no barramento CAN. Ele lê a velocidade real da TCU (câmbio 09G) via protocolo CAN e reconstrói todas as mensagens que o ABS original enviaria, tornando o comportamento do veículo indistinguível do estado funcional original.
 
 ---
 
@@ -130,7 +130,7 @@ ECU Motor
 
 | ID | Nome | Dado extraído |
 |---|---|---|
-| `0x7E9` | OBD2 TCU | Velocidade em km/h inteiro — PID `0x0D` |
+| `0x7E9` | CAN TCU | Velocidade em km/h inteiro — PID `0x0D` |
 | `0x288` | Motor_2 | Byte 2, bits 0–1 — dual brake switch |
 
 Os filtros de aceitação são configurados **nos registradores de hardware** do MCP2515:
@@ -226,7 +226,7 @@ Baud rate: **115200**
 | `freio` | Estado do pedal lido do `0x288` (`0` = solto, `1` = pressionado) |
 | `weg` | Posição atual do acumulador Wegimpulse (0–2047) |
 | `obd` | Tempo desde a última resposta válida da TCU (ms) |
-| `reads` | Total de leituras OBD2 recebidas desde o boot |
+| `reads` | Total de leituras CAN recebidas desde o boot |
 | `txOk` / `txErr` | Frames enviados com sucesso / frames com erro de transmissão |
 | `busOff` | Reinicializações por BUS-OFF (> 0 indica problema de hardware — verificar J1) |
 
