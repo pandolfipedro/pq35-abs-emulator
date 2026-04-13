@@ -148,7 +148,7 @@ byte0 = XOR(bytes 1–7) XOR (CAN_ID & 0xFF) XOR (CAN_ID >> 8)
 Baud rate: **115200**
 
 ```
-[v8.1] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
+[v9] vel=87.3 freio=0 weg=1423 obd=82ms reads=4821 txOk=98234 txErr=0 busOff=0
 ```
 
 | Campo | Significado |
@@ -165,19 +165,19 @@ Baud rate: **115200**
 
 ## Histórico de versões
 
-### v8.1
-- Freio lido do `Motor_2 (0x288)` via CAN — sem fio extra
-- Estado do freio refletido em `0x1A0` e `0x289`
-- Filtros hardware duplos: `RXB0→0x7E9` / `RXB1→0x288`
-- `iniciarCAN()` centralizado — `setup` e reinit usam o mesmo código
+ v8 - Correções críticas:
+ *   - 0x5A0 fator corrigido: 73.0 → 100.0 (igual 0x1A0/0x4A0, fonte: KMatrix oficial)
+ *   - 0x5A0 BR2_Wegimpulse adicionado (bytes 6-7): contador 11-bit de pulsos ABS
+ *   - 0xDA0 adicionado: "ABS vivo" exigido pelo cluster PQ35
+ *   - Counter 0x1A0 e 0x5A0: sempre incrementa (evita duplicatas que causam rejeição)
+ *   - OBD2 timeout: 500ms → 1000ms
+ *   - Serial log: 1s → 2s (evita bloqueio coincidindo com timer do 0x1A0)
 
-### v8.0
-- Fator `0x5A0` corrigido: `73.0 → 100.0`
-- `BR2_Wegimpulse` adicionado nos bytes 6–7 do `0x5A0`
-- `0xDA0` adicionado: keepalive do módulo ABS
-- Counters sempre incrementam
-- Deadzone corrigida: `<` → `<=` e aplicada também no envio
-
+ v9 - Freio via CAN (sem fio extra):
+ *   - Lê Motor_2 (0x288) byte2 bit0 = Bremslichtschalter (fonte: vw_golf_mk4.dbc)
+ *   - Reflete estado do freio em 0x1A0 byte1 bit3 e 0x289 byte1 bit1
+ *   - Filtros hardware: RXB0→0x7E9 (OBD2), RXB1→0x288 (Motor_2)
+ *   - ACAN2515 v2.1.5: begin() com 2 máscaras + 4 filtros (range obrigatório: 3-6)
 ***
 
 ## Referências
