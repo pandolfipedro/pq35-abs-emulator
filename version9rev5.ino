@@ -187,7 +187,6 @@ void lerCAN() {
 
 void enviarBremse1(float speedKmh) {
   uint16_t speedRaw  = (uint16_t)(speedKmh * 100.0f);
-  uint8_t  brakeFlag = freioAtivo ? 0x18 : 0x00;
 
   uint8_t data[8] = {
     0x00,
@@ -239,7 +238,6 @@ void enviarBremse2(float speedKmh) {
   if (speedKmh > 326.0f) speedKmh = 326.0f;
 
   uint16_t vel = ((uint16_t)(speedKmh * 100.0f) << 1) & 0xFFFE;
-  uint16_t ts  = (uint16_t)(agora / 2);
 
   wegimpulsAcum += speedKmh * (VCDS_WEGIMPULS / 3600.0f) * dt;
   uint16_t novos = (uint16_t)wegimpulsAcum;
