@@ -27,8 +27,13 @@ struct Config {
   uint32_t quartzHz = 8000000UL;
   uint32_t canBitrate = 500000UL;
 
-  // Odometria / impulsos (impulsos por km — calibrar no veículo se preciso)
+  // Odometria / impulsos (impulsos por km — calibrar no veículo se preciso).
+  // Em PQ35, "distance impulse number" típico do painel é 21960. Esse número bate
+  // com pulsos de roda (subida+descida) e é usado para Wegimpulse no mBremse_2/10.
   float impulsesPerKm = 21960.0f;
+  // Calibração de distância: serial a ~20 km/h mostrou ~10× impulsos vs teoria (21960/km).
+  // Ajuste fino: km_reais / km_indicados no painel, ou 1.0 se já bater.
+  float odoDistanceScale = 0.102f;
   float tyreRadiusM = 0.315f;  // raio dinâmico efetivo (~205/55 R16)
 
   // Abaixo disto a velocidade efetiva = 0 (CAN + odometria). Evita hodômetro
@@ -37,10 +42,14 @@ struct Config {
 
   // OBD2 (ISO 15765, mesmo barramento CAN)
   uint32_t obdRequestPeriodMs = 80;
-  uint32_t obdTimeoutMs = 450;       // após isto: mantém última velocidade
-  uint32_t obdHoldMaxMs = 2500;       // máximo segurando sem resposta válida
+  uint32_t obdTimeoutMs = 600;       // após isto: mantém última velocidade (RX pode atrasar com TX denso)
+  uint32_t obdHoldMaxMs = 3500;       // máximo segurando sem resposta válida
   float speedTauMs = 180.0f;          // constante de tempo filtro 1º ordem (ms)
-  float speedMaxDecayKmhPerS = 35.0f; // decaimento suave após expirar hold
+  float speedMaxDecayKmhPerS = 12.0f; // decaimento após falta de OBD (menos agressivo → menos queda de ponteiro)
+
+  // Limite de rampa só no CAN ABS (ponteiro): evita “queda” quando o filtro dá um salto a 0 por 1–2 frames.
+  float absCanSlewUpKmhPerS = 220.0f;
+  float absCanSlewDownKmhPerS = 65.0f; // subir se o ponteiro ficar “preguiçoso” a descer ao travar
 
   // IDs OBD (11-bit)
   uint16_t obdFunctional = 0x7DF;
@@ -80,20 +89,26 @@ static inline void writeBitsLE(uint8_t *data, unsigned startBit, unsigned bitLen
   }
 }
 
-static inline uint16_t speedToRaw200(float kmh) {
+static inline uint16_t speedToRaw100(float kmh) {
   if (kmh < 0.0f)
     kmh = 0.0f;
-  const float x = kmh * 200.0f;
+  // Bremse_3 em PQ35 tipicamente usa 0.01 km/h por bit (raw = km/h * 100).
+  // O fator 200 fazia o painel marcar ~2x.
+  const float x = kmh * 100.0f;
   if (x > 32766.0f)
     return 32766;
   return uint16_t(x + 0.5f);
 }
 
-// mittlere_Raddrehzahl (U/s): codificação observada via vw_pq.dbc + cantools
+// mittlere_Raddrehzahl (U/s): vw_pq.dbc — fator 0,002 (raw = phys / 0,002 = phys * 500).
+// O cantools confirma: o antigo *1000 + 1 dobrava a rotação no 0x5A0.
 static inline uint16_t midRevsToRaw(float revPerSec) {
   if (revPerSec < 0.0f)
     revPerSec = 0.0f;
-  const float r = revPerSec * 1000.0f + 1.0f;
+  float r = revPerSec / 0.002f;
+  // Com rev=0 o encode OEM usa raw=1 (init), mantendo decode em 0 U/s.
+  if (r < 1.0f)
+    r = 1.0f;
   if (r >= 65535.0f)
     return 65535;
   return uint16_t(r + 0.5f);
@@ -107,10 +122,17 @@ static inline float kmhToMidRevs(float kmh) {
   return v / circ;  // rev/s
 }
 
-/** Velocidade para CAN + odometria: zero dentro da zona morta (parado real). */
-static inline float effectiveSpeedKmh(float filteredKmh) {
+/** Só para hodômetro: zero na zona morta (evita subir parado com ruído OBD). */
+static inline float effectiveSpeedKmhForOdo(float filteredKmh) {
   const float a = fabsf(filteredKmh);
   if (a < kConfig.standstillDeadBandKmh)
+    return 0.0f;
+  return filteredKmh;
+}
+
+/** Velocidade alvo nos frames ABS (antes do slew): segue o filtro OBD, sem “corte” a 2 km/h. */
+static inline float speedForAbsCan(float filteredKmh) {
+  if (!isfinite(filteredKmh) || filteredKmh < 0.0f)
     return 0.0f;
   return filteredKmh;
 }
@@ -154,25 +176,47 @@ struct SpeedModel {
   float heldKmh = 0.0f;
   uint32_t lastGoodMs = 0;
   uint32_t lastAnyObdMs = 0;
+  uint32_t lastPositiveKmhMs = 0;
   bool haveEver = false;
+  uint8_t zeroRun = 0;
 
   void onObdSpeed(uint8_t rawKmh, uint32_t nowMs) {
-    const uint32_t dtMs = nowMs - lastAnyObdMs; // wrap-safe
+    uint32_t dtMs = nowMs - lastAnyObdMs; // wrap-safe
+    if (dtMs == 0) dtMs = 1;
+    if (dtMs > 1000) dtMs = 1000; // evita alpha=1 por "buracos" longos
     heldKmh = float(rawKmh);
     lastGoodMs = nowMs;
     lastAnyObdMs = nowMs;
     haveEver = true;
     if (!isfinite(filteredKmh))
       filteredKmh = 0.0f;
-    // ECU reporta 0 km/h → parado; sem isto o filtro pode manter resíduo e o hodômetro integra.
-    if (rawKmh == 0) {
-      filteredKmh = 0.0f;
+    if (rawKmh > 0)
+      lastPositiveKmhMs = nowMs;
+    // Um único frame 0 com TCU ainda reportando movimento há <120 ms: ignora (glitch).
+    // Janela curta para não atrasar parada real após desaceleração.
+    if (rawKmh == 0 && filteredKmh > 12.0f && lastPositiveKmhMs != 0 &&
+        (nowMs - lastPositiveKmhMs) < 120u) {
       return;
     }
+    if (rawKmh == 0)
+      zeroRun = (zeroRun < 255) ? uint8_t(zeroRun + 1u) : 255;
+    else
+      zeroRun = 0;
     // Alpha baseado no delta real entre amostras (evita drift se o loop atrasar).
     const float alpha = (kConfig.speedTauMs <= 1.0f)
                             ? 1.0f
                             : (1.0f - expf(-float(dtMs) / kConfig.speedTauMs));
+    // 0 km/h espúrio no OBD acontece; não derruba o ponteiro instantaneamente.
+    // Parado real no hodômetro: zona morta em effectiveSpeedKmhForOdo + decaimento do filtro.
+    if (rawKmh == 0 && filteredKmh > 3.0f && zeroRun < 10u) {
+      // ignora sequências curtas de 0 (~10 amostras @ ~80 ms)
+      return;
+    }
+    if (rawKmh == 0 && filteredKmh > 3.0f) {
+      const float alphaZero = fminf(alpha, 0.25f); // limita o degrau pra baixo
+      filteredKmh += (0.0f - filteredKmh) * alphaZero;
+      return;
+    }
     filteredKmh += (heldKmh - filteredKmh) * alpha;
   }
 
@@ -194,44 +238,116 @@ struct SpeedModel {
       return 0.0f;
     return filteredKmh;
   }
+
+  bool haveObdEver() const { return haveEver; }
+  uint8_t zeroRunCount() const { return zeroRun; }
+  float heldRawKmh() const { return heldKmh; }
 };
 
 static SpeedModel gSpeed;
 
+/** Rampa no CAN ABS — picos a 0 no filtro não viram 0 instantâneo no ponteiro.
+ *  Só usa tipos built-in: o IDE junta .ino por nome e pode compilar antes da struct SpeedModel. */
+static float slewLimitAbsCan(float targetKmh, float dtSec, bool haveObdEver, uint8_t zeroRun, float heldRawKmh,
+                             float kmhFilt) {
+  static float sOut = 0.0f;
+  const float dt = fmaxf(dtSec, 0.0005f);
+  if (!haveObdEver) {
+    sOut = 0.0f;
+    return 0.0f;
+  }
+  const float tgt = fmaxf(0.0f, targetKmh);
+  const bool stopOk =
+      (kmhFilt < 0.6f && zeroRun >= 12u) || (heldRawKmh < 0.5f && zeroRun >= 12u);
+  if (stopOk) {
+    sOut = tgt;
+    return sOut;
+  }
+  const float up = kConfig.absCanSlewUpKmhPerS * dt;
+  const float dn = kConfig.absCanSlewDownKmhPerS * dt;
+  if (tgt > sOut)
+    sOut = fminf(tgt, sOut + up);
+  else
+    sOut = fmaxf(tgt, sOut - dn);
+  return sOut;
+}
+
 // ---------------------------------------------------------------------------
 // Odometria (integração velocidade → impulsos)
 // ---------------------------------------------------------------------------
+// Um único contador de impulsos de distância (por km); Bremse_2 recebe o baixo
+// 11 bits. Bremse_10 reparte o mesmo total em 4 rodas (q+r/4) para que, se o
+// Kombi somar VL+VR+HL+HR, a soma ≈ impulsos reais — antes as 4 iguais somavam ~4×.
+// Impulszahl fica em 0: muitos clusters já integram só o Wegimpulse cumulativo;
+// enviar delta + contador pode dobrar a distância.
+static inline void splitVehicleImpToWheels(uint32_t v, uint16_t *vl, uint16_t *vr, uint16_t *hl, uint16_t *hr) {
+  const uint32_t q = v / 4u;
+  const uint32_t r = v % 4u;
+  *vl = uint16_t((q + (r > 0u ? 1u : 0u)) & 0x3FFu);
+  *vr = uint16_t((q + (r > 1u ? 1u : 0u)) & 0x3FFu);
+  *hl = uint16_t((q + (r > 2u ? 1u : 0u)) & 0x3FFu);
+  *hr = uint16_t((q + (r > 3u ? 1u : 0u)) & 0x3FFu);
+}
+
 struct Odometer {
-  double impulseFrac = 0.0;   // acumulador fracionário
-  uint32_t totalImpulses = 0;
+  double impulseFrac = 0.0;
+  uint32_t vehImpulses = 0;
+  uint32_t vehImpulsesAtLastB2 = 0;
 
   void reset() {
     impulseFrac = 0.0;
-    totalImpulses = 0;
+    vehImpulses = 0;
+    vehImpulsesAtLastB2 = 0;
   }
 
   void integrate(float kmh, float dtSec) {
-    // `kmh` já chega com zona morta aplicada (effectiveSpeedKmh).
-    const double impPerM = (double)kConfig.impulsesPerKm / 1000.0;
+    const double impPerM = (double)kConfig.impulsesPerKm / 1000.0 * (double)kConfig.odoDistanceScale;
     const double vMs = (double)kmh / 3.6;
     impulseFrac += vMs * dtSec * impPerM;
     if (impulseFrac >= 1.0) {
       const uint32_t add = (uint32_t)floor(impulseFrac);
-      totalImpulses += add;
+      vehImpulses += add;
       impulseFrac -= (double)add;
     }
   }
 
-  uint16_t weg11Front() const { return uint16_t(totalImpulses & 0x7FFu); }
-  uint8_t imp6() const { return uint8_t(totalImpulses & 0x3Fu); }
-  uint16_t weg10Wheel() const { return uint16_t(totalImpulses & 0x3FFu); }
+  uint16_t weg11FrontAxle() const { return uint16_t(vehImpulses & 0x7FFu); }
+
+  /** Impulsos desde o último 0x5A0 (coerente com o incremento de Wegimpulse). */
+  uint8_t impulszahlForBremse2() {
+    const uint32_t d = vehImpulses - vehImpulsesAtLastB2;
+    vehImpulsesAtLastB2 = vehImpulses;
+    return (d > 63u) ? 63u : uint8_t(d);
+  }
+
+  void weg10Wheels(uint16_t *vl, uint16_t *vr, uint16_t *hl, uint16_t *hr) const {
+    splitVehicleImpToWheels(vehImpulses, vl, vr, hl, hr);
+  }
+
+  uint32_t totalImpulsesForLogging() const { return vehImpulses; }
 };
 
 static Odometer gOdo;
 
 // ---------------------------------------------------------------------------
-// OBD2 ISO-TP (single frame) — PID 0x0D
+// OBD2 ISO15765 — PID 0x0D (velocidade)
+// Muitos PQ35 respondem no MOTOR 0x7E8 (pedido 0x7E0), não na TCU 0x7E9.
+// Filtro MCP2515 tem de aceitar 0x7E8 e 0x7E9. Payload pode ser 03 41 0D XX ou outro PCI.
 // ---------------------------------------------------------------------------
+static bool extractMode01Pid0d(const CANMessage &m, uint8_t *outKmh) {
+  if (m.rtr || m.len < 3)
+    return false;
+  if (m.len >= 2 && m.data[0] == 0x03u && m.data[1] == 0x7Fu)
+    return false; // resposta negativa
+  for (unsigned i = 0; i + 2u < (unsigned)m.len && i < 7u; ++i) {
+    if (m.data[i] == 0x41u && m.data[i + 1] == 0x0Du) {
+      *outKmh = m.data[i + 2];
+      return true;
+    }
+  }
+  return false;
+}
+
 struct ObdClient {
   uint32_t lastTxMs = 0;
 
@@ -247,19 +363,23 @@ struct ObdClient {
     m.len = 8;
     m.ext = false;
     m.rtr = false;
-
-    // Velocidade vem apenas da TCU (0x7E9)
-    m.id = kConfig.obdTransReq;
     m.data[0] = 0x02;
     m.data[1] = 0x01;
     m.data[2] = 0x0D;
+
+    m.id = kConfig.obdEngineReq;
+    (void)gCan.tryToSend(m);
+    m.id = kConfig.obdTransReq;
     (void)gCan.tryToSend(m);
 
-    // ocasionalmente broadcast funcional (ajuda se endereço ECU variar)
     static uint8_t s = 0;
     s++;
-    if ((s % 6u) == 0u) {
+    if ((s % 8u) == 0u) {
       m.id = kConfig.obdFunctional;
+      memset(m.data, 0, 8);
+      m.data[0] = 0x02;
+      m.data[1] = 0x01;
+      m.data[2] = 0x0D;
       (void)gCan.tryToSend(m);
     }
   }
@@ -267,14 +387,12 @@ struct ObdClient {
   void pollReceive(uint32_t nowMs) {
     CANMessage m;
     while (gCan.receive(m)) {
-      if (m.len < 4 || m.rtr)
+      const uint16_t id = m.id;
+      if (id != kConfig.obdEngineRsp && id != kConfig.obdTransRsp)
         continue;
-      if (m.data[1] != 0x41 || m.data[2] != 0x0D)
+      uint8_t v = 0;
+      if (!extractMode01Pid0d(m, &v))
         continue;
-      const uint8_t nBytes = m.data[0];
-      if (nBytes < 3)
-        continue;
-      const uint8_t v = m.data[3];
       gSpeed.onObdSpeed(v, nowMs);
     }
   }
@@ -315,15 +433,19 @@ static void buildBremse1(uint8_t *d, float kmh) {
 
 static void buildBremse3(uint8_t *d, float kmh) {
   memset(d, 0, 8);
-  const uint16_t w = speedToRaw200(kmh);
-  d[0] = uint8_t(w & 0xFFu);
-  d[1] = uint8_t((w >> 8) & 0xFFu);
-  d[2] = uint8_t(w & 0xFFu);
-  d[3] = uint8_t((w >> 8) & 0xFFu);
-  d[4] = uint8_t(w & 0xFFu);
-  d[5] = uint8_t((w >> 8) & 0xFFu);
-  d[6] = uint8_t(w & 0xFFu);
-  d[7] = uint8_t((w >> 8) & 0xFFu);
+  // vw_pq.dbc BO_ 1184 Bremse_3: 4× Radgeschw_* @ 0,01 km/h (15 bit), separados por 1 bit "Frei".
+  // Não repetir uint16 em todo o payload — isso quebrava o layout e gerava leitura absurda no Kombi.
+  if (kmh < 0.0f)
+    kmh = 0.0f;
+  const uint32_t raw = speedToRaw100(kmh); // 0,01 km/h por unidade, 15 bit
+  writeBitsLE(d, 0, 1, 0);   // Frei_Bremse_3_1
+  writeBitsLE(d, 1, 15, raw); // Radgeschw__VL_4_1
+  writeBitsLE(d, 16, 1, 0);  // Frei_Bremse_3_2
+  writeBitsLE(d, 17, 15, raw); // Radgeschw__VR_4_1
+  writeBitsLE(d, 32, 1, 0);  // Frei_Bremse_3_3
+  writeBitsLE(d, 33, 15, raw); // Radgeschw__HL_4_1
+  writeBitsLE(d, 48, 1, 0);  // Frei_Bremse_3_4
+  writeBitsLE(d, 49, 15, raw); // Radgeschw__HR_4_1
 }
 
 static void buildBremse2(uint8_t *d, float kmh, uint16_t zeitTicks, uint16_t weg11, uint8_t imp6) {
@@ -347,7 +469,7 @@ static void buildBremse2(uint8_t *d, float kmh, uint16_t zeitTicks, uint16_t weg
   writeBitsLE(d, 56, 6, uint32_t(imp6 & 0x3Fu));
 }
 
-static void buildBremse10(uint8_t *d, uint16_t weg10each) {
+static void buildBremse10(uint8_t *d, uint16_t weg10VL, uint16_t weg10VR, uint16_t weg10HL, uint16_t weg10HR) {
   memset(d, 0, 8);
   // B10_Zaehler @ bit 8 len 4
   writeBitsLE(d, 8, 4, gB10Zaehler & 0x0Fu);
@@ -356,11 +478,10 @@ static void buildBremse10(uint8_t *d, uint16_t weg10each) {
   writeBitsLE(d, 13, 1, 1);
   writeBitsLE(d, 14, 1, 1);
   writeBitsLE(d, 15, 1, 1);
-  const uint32_t w = uint32_t(weg10each & 0x3FFu);
-  writeBitsLE(d, 16, 10, w);
-  writeBitsLE(d, 26, 10, w);
-  writeBitsLE(d, 36, 10, w);
-  writeBitsLE(d, 46, 10, w);
+  writeBitsLE(d, 16, 10, uint32_t(weg10VL & 0x3FFu));
+  writeBitsLE(d, 26, 10, uint32_t(weg10VR & 0x3FFu));
+  writeBitsLE(d, 36, 10, uint32_t(weg10HL & 0x3FFu));
+  writeBitsLE(d, 46, 10, uint32_t(weg10HR & 0x3FFu));
   // QB Fahrtr_* @ 56..59 = 1 (válido); Fahrtr_* @ 60..63 = 0 — alinha encode padrão vw_pq.dbc
   writeBitsLE(d, 56, 1, 1);
   writeBitsLE(d, 57, 1, 1);
@@ -400,12 +521,10 @@ void setup() {
 
   ACAN2515Settings settings(kConfig.quartzHz, kConfig.canBitrate);
   settings.mRequestedMode = ACAN2515Settings::NormalMode;
-  // Filtros RX (hardware MCP2515):
-  // - RXB0 (RXM0 + filtros 0..1): aceita somente 0x7E9
-  // - RXB1 (RXM1 + filtros 2..5): bloqueia tudo (ID=0x000 com máscara 0x7FF)
+  // Filtros RX: OBD responde em 0x7E8 (motor) e/ou 0x7E9 (trans) — aceitar os dois.
   const ACAN2515Mask rxm = standard2515Mask(0x7FF, 0x00, 0x00); // compara todos os 11 bits do ID padrão
   const ACAN2515AcceptanceFilter filters[] = {
-      {standard2515Filter(kConfig.obdTransRsp, 0x00, 0x00), nullptr},
+      {standard2515Filter(kConfig.obdEngineRsp, 0x00, 0x00), nullptr},
       {standard2515Filter(kConfig.obdTransRsp, 0x00, 0x00), nullptr},
       {standard2515Filter(0x000, 0x00, 0x00), nullptr},
       {standard2515Filter(0x000, 0x00, 0x00), nullptr},
@@ -436,8 +555,14 @@ void loop() {
   gSpeed.tick(ms, dtSec);
 
   const float kmhFilt = gSpeed.displayKmh();
-  const float kmh = effectiveSpeedKmh(kmhFilt);
-  gOdo.integrate(kmh, dtSec);
+  const float kmhCan = speedForAbsCan(kmhFilt);
+  const float kmhAbsTx =
+      slewLimitAbsCan(kmhCan, dtSec, gSpeed.haveObdEver(), gSpeed.zeroRunCount(), gSpeed.heldRawKmh(), kmhFilt);
+  const float kmhOdo = effectiveSpeedKmhForOdo(kmhFilt);
+  // Evita um único loop longo (bloqueio) integrar hodômetro como se fossem vários s a ~20 km/h.
+  const float dtOdo = fminf(dtSec, 0.08f);
+  gOdo.integrate(kmhOdo, dtOdo);
+  gObd.pollReceive(ms); // esvazia RX após TX (OBD pode ter chegado durante envio ABS)
 
   static PeriodicDeadline t10(10000);
   static PeriodicDeadline t20(20000);
@@ -456,8 +581,8 @@ void loop() {
   // 10 ms: 0x1A0 e 0x4A0
   if (t10.poll()) {
     sZeit = uint16_t(sZeit + 10);  // incremento coerente com tick 10 ms
-    buildBremse1(b1, kmh);
-    buildBremse3(b3, kmh);
+    buildBremse1(b1, kmhAbsTx);
+    buildBremse3(b3, kmhAbsTx);
     if (!sendFrame(kIdBremse1, b1))
       txFail1A0++;
     if (!sendFrame(kIdBremse3, b3))
@@ -467,8 +592,10 @@ void loop() {
 
   // 20 ms: 0x5A0 e 0x3A0
   if (t20.poll()) {
-    buildBremse2(b2, kmh, sZeit, gOdo.weg11Front(), gOdo.imp6());
-    buildBremse10(b10, gOdo.weg10Wheel());
+    uint16_t wvl, wvr, whl, whr;
+    gOdo.weg10Wheels(&wvl, &wvr, &whl, &whr);
+    buildBremse2(b2, kmhAbsTx, sZeit, gOdo.weg11FrontAxle(), gOdo.impulszahlForBremse2());
+    buildBremse10(b10, wvl, wvr, whl, whr);
     if (!sendFrame(kIdBremse2, b2))
       txFail5A0++;
     if (!sendFrame(kIdBremse10, b10))
@@ -480,12 +607,14 @@ void loop() {
   static uint32_t lastLog = 0;
   if (ms - lastLog > 1000) {
     lastLog = ms;
-    Serial.print(F("km/h (filt/efet): "));
+    Serial.print(F("km/h filt/CANtx/odo: "));
     Serial.print(kmhFilt, 1);
     Serial.print('/');
-    Serial.print(kmh, 1);
+    Serial.print(kmhAbsTx, 1);
+    Serial.print('/');
+    Serial.print(kmhOdo, 1);
     Serial.print(F(" | impulsos: "));
-    Serial.print(gOdo.totalImpulses);
+    Serial.print(gOdo.totalImpulsesForLogging());
     Serial.print(F(" | RX buf: "));
     Serial.println(gCan.receiveBufferCount());
     Serial.print(F("TX fail 1A0/4A0/5A0/3A0: "));
