@@ -1,9 +1,28 @@
+
+//  +------------------+----------+---------+---------------------------------+
+//  | MCP2515          |  GPIO    |  Sinal  |  Observacao                     |
+//  +------------------+----------+---------+---------------------------------+
+//  |  VCC             |  +5V     |  ---    |  modulo tem regulador 3V3 onbd  |
+//  |  GND             |  GND     |  ---    |                                 |
+//  |  CS              |  GPIO 5  |  SPI_SS |  kConfig.mcpCs                  |
+//  |  SCK             |  GPIO 18 |  SPI_CK |  HSPI/VSPI default do ESP32     |
+//  |  MOSI / SI       |  GPIO 23 |  SPI_MO |  HSPI/VSPI default do ESP32     |
+//  |  MISO / SO       |  GPIO 19 |  SPI_MI |  HSPI/VSPI default do ESP32     |
+//  |  INT             |  GPIO 2  |  IRQ    |  kConfig.mcpInt (RX-IRQ ativo)  |
+//  +------------------+----------+---------+---------------------------------+
+
 #include <Arduino.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <esp_idf_version.h>
 #include <SPI.h>
 #include <cmath>
 #include <cstring>
 #include <ACAN2515.h>
+
+
+static constexpr uint32_t kWdtTimeoutMs = 2000;
 
 struct Config {
    uint8_t mcpCs = 5;
@@ -23,9 +42,6 @@ struct Config {
    float speedMaxDecayKmhPerS = 12.0f;
    float absCanSlewUpKmhPerS = 220.0f;
    float absCanSlewDownKmhPerS = 65.0f;
-   uint16_t obdFunctional = 0x7DF;
-   uint16_t obdEngineReq = 0x7E0;
-   uint16_t obdEngineRsp = 0x7E8;
    uint16_t obdTransReq = 0x7E1;
    uint16_t obdTransRsp = 0x7E9;
    int32_t maxScheduleSlipUs = 3500;
@@ -35,7 +51,6 @@ struct Config {
    bool useMotionCanFusion = true;
    bool motionZeroInPark = true;
    uint32_t motionCanTimeoutMs = 500;
-   float motionRpmMinDriving = 450.0f;
    uint8_t gearWahlPark = 8;
    uint8_t gearWahlReverse = 7;
    uint8_t gearWahlNeutral = 6;
@@ -44,6 +59,9 @@ struct Config {
    float motionAntiDropMaxKmhPerS = 90.0f;
    bool emitCompanionEspFrames = true;
    bool emitBremse4HaldexFrame = false;
+   // Calibracao do painel: a 100 km/h o cluster mostrava ~95, queremos ~103
+   // (overshoot OEM). Fator = 103/95 ~= 1.084. Aplicado SO em Bremse_1/3.
+   float speedPanelScaleFactor = 1.084f;
 } kConfig;
 
 static inline float effectiveImpulsesPerKm() {
@@ -54,21 +72,23 @@ static inline float effectiveImpulsesPerKm() {
   return kConfig.impulsesPerKmCoding * scale;
 }
 
-static constexpr uint16_t kIdBremse1 = 0x1A0;
-static constexpr uint16_t kIdBremse3 = 0x4A0;
-static constexpr uint16_t kIdBremse2 = 0x5A0;
-static constexpr uint16_t kIdBremse10 = 0x3A0;
-static constexpr uint16_t kIdBremse5 = 0x4A8;
-static constexpr uint16_t kIdBremse6 = 0x1A8;
-static constexpr uint16_t kIdBremse4 = 0x2A0;
-static constexpr uint16_t kIdBremse8 = 0x1AC;
-static constexpr uint16_t kIdBremse11 = 0x5B7;
-static constexpr uint16_t kIdMotorBremse = 0x284;
-static constexpr uint16_t kIdMotor1 = 0x280;
+static constexpr uint16_t kIdBremse1   = 0x1A0;
+static constexpr uint16_t kIdBremse3   = 0x4A0;
+static constexpr uint16_t kIdBremse2   = 0x5A0;
+static constexpr uint16_t kIdBremse10  = 0x3A0;
+static constexpr uint16_t kIdBremse5   = 0x4A8;
+static constexpr uint16_t kIdBremse6   = 0x1A8;
+static constexpr uint16_t kIdBremse4   = 0x2A0;
+static constexpr uint16_t kIdBremse8   = 0x1AC;
+static constexpr uint16_t kIdBremse11  = 0x5B7;
 static constexpr uint16_t kIdGetriebe1 = 0x440;
 static constexpr uint16_t kIdGetriebe2 = 0x540;
 
  static ACAN2515 gCan(kConfig.mcpCs, SPI, kConfig.mcpInt);
+
+ static inline uint32_t nowMillis() {
+   return (uint32_t)(esp_timer_get_time() / 1000ULL);
+ }
 
  static inline void writeBitsLE(uint8_t *data, unsigned startBit, unsigned bitLen, uint32_t value) {
    for (unsigned i = 0; i < bitLen; ++i) {
@@ -136,6 +156,20 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
    return filteredKmh;
  }
 
+ // Agendador rate-monotonic em microssegundos.
+ //
+ // Doutrina: a proxima "deadline" e calculada a partir da deadline anterior
+ // (nextUs += periodUs), NAO a partir do "agora". Assim, se a iteracao
+ // atrasou X us, a proxima espera fica X us mais curta -> a cadencia media
+ // do periodo permanece exata, sem drift. Se o atraso passar de
+ // kConfig.maxScheduleSlipUs (sistema travou ou houve um burst), reagenda
+ // a partir de "agora" para evitar disparar varios ticks atrasados de uma
+ // vez (anti burst-catch).
+ //
+ // poll(usNow): aceita opcionalmente o "agora" da iteracao para reusar
+ // uma unica leitura de esp_timer_get_time() em todo o loop principal,
+ // garantindo que tarefas concorrentes ancoradas no mesmo instante
+ // disparem coerentemente.
  struct PeriodicDeadline {
    int64_t nextUs = 0;
    const int32_t periodUs;
@@ -150,20 +184,24 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
      nextUs = other.nextDeadlineUs() + offsetUs;
    }
 
-   bool poll() {
-     const int64_t now = esp_timer_get_time();
+   bool poll(int64_t usNow = -1) {
+     const int64_t now = (usNow >= 0) ? usNow : esp_timer_get_time();
      if (now < nextUs)
        return false;
-     int64_t slip = now - nextUs;
+     const int64_t slip = now - nextUs;
      if (slip > kConfig.maxScheduleSlipUs) {
-       nextUs = now + periodUs;
+       nextUs = now + periodUs;  // anti burst-catch
      } else {
-       nextUs += periodUs;
+       nextUs += periodUs;       // rate-monotonic puro
      }
      return true;
    }
  };
 
+ // ============================================================
+ // SpeedModel: pipeline de filtro IIR + tolerancia a zeros do OBD.
+ // Inalterado em relacao a versao funcional 100%.
+ // ============================================================
  struct SpeedModel {
    float filteredKmh = 0.0f;
    float heldKmh = 0.0f;
@@ -202,7 +240,6 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
      const unsigned maxZeroIgnore =
          (filteredKmh > 45.0f) ? 30u : ((filteredKmh > 40.0f) ? 25u : 10u);
      if (rawKmh == 0 && filteredKmh > 3.0f && zeroRun < maxZeroIgnore) {
-
        return;
      }
      if (rawKmh == 0 && filteredKmh > 3.0f) {
@@ -217,7 +254,7 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
      const uint32_t dtMs = nowMs - lastAnyObdMs;
      if (dtMs > kConfig.obdTimeoutMs) {
        if (haveEver && dtMs < kConfig.obdHoldMaxMs) {
-
+         // hold: mantem filteredKmh
        } else if (haveEver && dtMs >= kConfig.obdHoldMaxMs) {
          const float dec = kConfig.speedMaxDecayKmhPerS * dtSec;
          filteredKmh = fmaxf(0.0f, filteredKmh - dec);
@@ -239,22 +276,17 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
 
  static SpeedModel gSpeed;
 
+ // ============================================================
+ // VehicleMotionFromCan: agora le APENAS Getriebe1/2 (cambio).
+ // Motor1 (0x280, RPM) foi removido a pedido. motionDrivingOem
+ // baseia-se SOMENTE em wahlPos / engagedGear.
+ // ============================================================
 struct VehicleMotionFromCan {
-  float motorRpm = 0.0f;
-  uint32_t lastMotor1Ms = 0;
   uint8_t wahlPos = 0xFF;
   uint32_t lastGearMs = 0;
   uint8_t ganganzeige = 0xFF;
   uint8_t engagedGear = 0xFF;
   uint32_t lastGear2Ms = 0;
-
-  void onMotor1(const CANMessage &m, uint32_t nowMs) {
-    if (m.rtr || m.len < 4)
-      return;
-    const uint32_t raw = readBitsLE(m.data, 16, 16);
-    motorRpm = float(raw) * 0.25f;
-    lastMotor1Ms = nowMs;
-  }
 
   void onGetriebe1(const CANMessage &m, uint32_t nowMs) {
     if (m.rtr || m.len < 2)
@@ -271,9 +303,6 @@ struct VehicleMotionFromCan {
     lastGear2Ms = nowMs;
   }
 
-  bool motorFresh(uint32_t nowMs) const {
-    return lastMotor1Ms != 0 && (nowMs - lastMotor1Ms) < kConfig.motionCanTimeoutMs;
-  }
   bool gearFresh(uint32_t nowMs) const {
     return lastGearMs != 0 && (nowMs - lastGearMs) < kConfig.motionCanTimeoutMs;
   }
@@ -284,12 +313,11 @@ struct VehicleMotionFromCan {
   bool isDriveOrReverse() const {
     return wahlPos == kConfig.gearWahlDrive || wahlPos == kConfig.gearWahlReverse;
   }
-  bool drivingLoadLikely() const { return motorRpm >= kConfig.motionRpmMinDriving; }
   bool hasEngagedForwardGear() const { return engagedGear >= 1u && engagedGear <= 6u; }
 
+  // Sem RPM, "movimento OEM" passa a ser: marcha em D/R ou marcha
+  // engatada (1-6) reportada pelo Getriebe2. Em Park retorna false.
   bool motionDrivingOem(uint32_t nowMs) const {
-    if (!motorFresh(nowMs) || !drivingLoadLikely())
-      return false;
     if (gearFresh(nowMs) && isPark())
       return false;
     if (gearFresh(nowMs) && isDriveOrReverse())
@@ -324,6 +352,10 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
   return out;
 }
 
+ // ============================================================
+ // SpeedPanelCache: janela de 5 amostras com rejeicao de outliers.
+ // Inalterado em relacao a versao funcional 100%.
+ // ============================================================
  struct SpeedPanelCache {
    static constexpr unsigned kN = 5;
    float window[kN] = {};
@@ -370,9 +402,8 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      if (cnt > 0) {
        lastAvg = sum / float(cnt);
      } else {
-
-      if (kConfig.useMotionCanFusion && gVehicleMotion.motionDrivingOem(nowMs) && haveAvg) {
-
+       if (kConfig.useMotionCanFusion && gVehicleMotion.motionDrivingOem(nowMs) && haveAvg) {
+         // mantem lastAvg
        } else {
          lastAvg = 0.0f;
        }
@@ -438,6 +469,9 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    *hr = uint16_t((q + (r > 3u ? 1u : 0u)) & 0x3FFu);
  }
 
+ // ============================================================
+ // Odometer: contagem de pulsos. Inalterado.
+ // ============================================================
  struct Odometer {
    double impulseFrac = 0.0;
    uint32_t vehImpulses = 0;
@@ -491,6 +525,12 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    return false;
  }
 
+ // ============================================================
+ // ObdClient
+ //   - Pergunta SO para a transmissao (0x7E1) e aceita SO 0x7E9.
+ //   - Auto-mute em Park: nada na rede CAN com o carro parado, libera
+ //     o canal de diagnostico para o VCDS conversar com o cambio.
+ // ============================================================
  struct ObdClient {
    uint32_t lastTxMs = 0;
 
@@ -499,6 +539,12 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    void trySendRequests(uint32_t nowMs) {
      if (nowMs - lastTxMs < kConfig.obdRequestPeriodMs)
        return;
+
+     // Auto-mute em Park: se o cambio reporta P, nao envia OBD.
+     if (kConfig.useMotionCanFusion &&
+         gVehicleMotion.gearFresh(nowMs) && gVehicleMotion.isPark())
+       return;
+
      lastTxMs = nowMs;
 
      CANMessage m;
@@ -509,40 +555,23 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      m.data[0] = 0x02;
      m.data[1] = 0x01;
      m.data[2] = 0x0D;
-
-     m.id = kConfig.obdEngineReq;
-     (void)gCan.tryToSend(m);
      m.id = kConfig.obdTransReq;
      (void)gCan.tryToSend(m);
-
-     static uint8_t s = 0;
-     s++;
-
-     if ((s % 32u) == 0u) {
-       m.id = kConfig.obdFunctional;
-       memset(m.data, 0, 8);
-       m.data[0] = 0x02;
-       m.data[1] = 0x01;
-       m.data[2] = 0x0D;
-       (void)gCan.tryToSend(m);
-     }
    }
 
    void pollReceive(uint32_t nowMs) {
      CANMessage m;
      while (gCan.receive(m)) {
        const uint16_t id = m.id;
-       if (id == kConfig.obdEngineRsp || id == kConfig.obdTransRsp) {
+       if (id == kConfig.obdTransRsp) {
          uint8_t v = 0;
          if (extractMode01Pid0d(m, &v))
            gSpeed.onObdSpeed(v, nowMs);
-       } else if (id == kIdMotor1) {
-         gVehicleMotion.onMotor1(m, nowMs);
-      } else if (id == kIdGetriebe1) {
-        gVehicleMotion.onGetriebe1(m, nowMs);
-      } else if (id == kIdGetriebe2) {
-        gVehicleMotion.onGetriebe2(m, nowMs);
-      }
+       } else if (id == kIdGetriebe1) {
+         gVehicleMotion.onGetriebe1(m, nowMs);
+       } else if (id == kIdGetriebe2) {
+         gVehicleMotion.onGetriebe2(m, nowMs);
+       }
      }
    }
  };
@@ -554,7 +583,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
  static uint8_t gBr5Zaehler = 0;
  static uint8_t gBr8Zaehler = 0;
  static uint8_t gBr11Zaehler = 0;
- static uint8_t gMobZaehler = 0;
  static uint8_t gBr6Zaehler = 0;
 
  static void buildBremse1(uint8_t *d, float kmh) {
@@ -634,34 +662,38 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    d[0] = x;
  }
 
- static void buildBremse5Idle(uint8_t *d) {
+ // Builders dos companion frames: APENAS montam o frame. O incremento do
+ // Zaehler e feito no caller, somente quando tryToSend() retornar true.
+ // Razao: gateway PQ35 detecta "frame perdido" quando ve o counter pular.
+ // Se a TX falhar, o frame nao foi pro bus, entao reusar o mesmo counter
+ // na proxima tentativa e o comportamento correto.
+
+ // Bremse_5 idle. Se stillstand=true, sinaliza BR5_Stillstand (bit 28) =1
+ // -> Autohold/HSA/EPB reconhecem corretamente o estado de parada.
+ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
    memset(d, 0, 8);
+   if (stillstand) writeBitsLE(d, 28, 1, 1);
    writeBitsLE(d, 52, 4, uint32_t(gBr5Zaehler & 0x0Fu));
    uint8_t x = 0;
    for (int i = 0; i < 7; ++i)
      x ^= d[i];
    d[7] = x;
-   gBr5Zaehler = uint8_t((gBr5Zaehler + 1u) & 0x0Fu);
  }
 
+ // Bremse_8 idle. Aceleracoes neutras (0 m/s^2):
+ //   BR8_Istbeschl   (bit 32, 9, scale 0.02,    offset -7.22) -> raw 361
+ //   BR8_Laengsbeschl(bit 48, 10, scale 0.03125, offset -16)  -> raw 512
+ // Sem isso, raw 0 representa -7.22 / -16 m/s^2 (frenagem violenta) e
+ // pode confundir o painel/ESP companion.
  static void buildBremse8Idle(uint8_t *d) {
    memset(d, 0, 8);
    writeBitsLE(d, 8, 4, uint32_t(gBr8Zaehler & 0x0Fu));
+   writeBitsLE(d, 32, 9, 361u);
+   writeBitsLE(d, 48, 10, 512u);
    uint8_t x = 0;
    for (int i = 1; i < 8; ++i)
      x ^= d[i];
    d[0] = x;
-   gBr8Zaehler = uint8_t((gBr8Zaehler + 1u) & 0x0Fu);
- }
-
- static void buildMotorBremseIdle(uint8_t *d) {
-   memset(d, 0, 6);
-   writeBitsLE(d, 8, 4, uint32_t(gMobZaehler & 0x0Fu));
-   uint8_t x = 0;
-   for (int i = 1; i < 6; ++i)
-     x ^= d[i];
-   d[0] = x;
-   gMobZaehler = uint8_t((gMobZaehler + 1u) & 0x0Fu);
  }
 
  static void buildBremse6Idle(uint8_t *d) {
@@ -669,7 +701,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    writeBitsLE(d, 0, 10, 123u);
    writeBitsLE(d, 12, 4, uint32_t(gBr6Zaehler & 0x0Fu));
    d[2] = uint8_t(d[0] ^ d[1]);
-   gBr6Zaehler = uint8_t((gBr6Zaehler + 1u) & 0x0Fu);
  }
 
  static void buildBremse11Idle(uint8_t *d) {
@@ -679,7 +710,14 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    for (int i = 1; i < 8; ++i)
      x ^= d[i];
    d[0] = x;
-   gBr11Zaehler = uint8_t((gBr11Zaehler + 1u) & 0x0Fu);
+ }
+
+ // Bremse_4 idle (Haldex). ABS_Vorgabewert_mitte_Kupplungs (bit 0, 8,
+ // scale 3, offset -381): raw 127 = 0 Nm/min (torque neutro). Outros
+ // bytes ficam 0. DBC nao define counter pra este frame.
+ static void buildBremse4Idle(uint8_t *d) {
+   memset(d, 0, 3);
+   d[0] = 127;
  }
 
  static inline bool sendFrame(uint16_t id, const uint8_t *data8) {
@@ -706,10 +744,28 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
  static void IRAM_ATTR canISR() { gCan.isr(); }
 
+ static const __FlashStringHelper* resetReasonStr(esp_reset_reason_t r) {
+   switch (r) {
+     case ESP_RST_POWERON:  return F("POWERON");
+     case ESP_RST_EXT:      return F("EXT");
+     case ESP_RST_SW:       return F("SW");
+     case ESP_RST_PANIC:    return F("PANIC");
+     case ESP_RST_INT_WDT:  return F("INT_WDT");
+     case ESP_RST_TASK_WDT: return F("TASK_WDT");
+     case ESP_RST_WDT:      return F("WDT");
+     case ESP_RST_DEEPSLEEP:return F("DEEPSLEEP");
+     case ESP_RST_BROWNOUT: return F("BROWNOUT");
+     case ESP_RST_SDIO:     return F("SDIO");
+     default:               return F("UNKNOWN");
+   }
+ }
+
  void setup() {
    Serial.begin(115200);
    delay(200);
-   Serial.println(F("MK60 PQ35 ABS — OBD 0x0D + Bremse 1/2/3/10 + opt. ESP sat. | RX 280/440/540"));
+   Serial.println(F("MK60 PQ35 ABS - cambio-only OBD | RX 440/540"));
+   Serial.print(F("Reset reason: "));
+   Serial.println(resetReasonStr(esp_reset_reason()));
 
    SPI.begin(18, 19, 23);
 
@@ -718,45 +774,78 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
    const ACAN2515Mask rxm = standard2515Mask(0x7FF, 0x00, 0x00);
    const ACAN2515AcceptanceFilter filters[] = {
-       {standard2515Filter(kConfig.obdEngineRsp, 0x00, 0x00), nullptr},
        {standard2515Filter(kConfig.obdTransRsp, 0x00, 0x00), nullptr},
-       {standard2515Filter(kIdMotor1, 0x00, 0x00), nullptr},
-      {standard2515Filter(kIdGetriebe1, 0x00, 0x00), nullptr},
-      {standard2515Filter(kIdGetriebe2, 0x00, 0x00), nullptr},
-       {standard2515Filter(0x000, 0x00, 0x00), nullptr},
+       {standard2515Filter(kIdGetriebe1, 0x00, 0x00), nullptr},
+       {standard2515Filter(kIdGetriebe2, 0x00, 0x00), nullptr},
    };
-   const uint16_t err =
-       gCan.begin(settings, canISR, rxm, rxm, filters, uint8_t(sizeof(filters) / sizeof(filters[0])));
-   if (err != 0) {
-     Serial.print(F("ACAN2515 begin erro: 0x"));
+
+   uint16_t err = 0;
+   for (int attempt = 1; attempt <= 5; ++attempt) {
+     err = gCan.begin(settings, canISR, rxm, rxm,
+                      filters, uint8_t(sizeof(filters) / sizeof(filters[0])));
+     if (err == 0) break;
+     Serial.print(F("ACAN2515 begin tentativa "));
+     Serial.print(attempt);
+     Serial.print(F(" falhou: 0x"));
      Serial.println(err, HEX);
-     while (true)
-       delay(500);
+     delay(500);
+   }
+   if (err != 0) {
+     Serial.println(F("[FATAL] MCP2515 nao inicializou. Reiniciando..."));
+     Serial.flush();
+     delay(200);
+     esp_restart();
    }
    Serial.println(F("MCP2515 OK @ 500k"));
 
    gObd.setup();
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+   {
+     const esp_task_wdt_config_t wdt_cfg = {
+       .timeout_ms     = kWdtTimeoutMs,
+       .idle_core_mask = 0,
+       .trigger_panic  = true,
+     };
+     esp_task_wdt_reconfigure(&wdt_cfg);
+   }
+#else
+   esp_task_wdt_init(kWdtTimeoutMs / 1000u, true);
+#endif
+   esp_task_wdt_add(NULL);
  }
 
  void loop() {
-   const uint32_t ms = millis();
+   // Relogio de microssegundos capturado UMA UNICA VEZ por iteracao.
+   // Todos os subsistemas que precisam de "agora" derivam deste valor:
+   //   - ms   = usNow / 1000    (modulos legados que esperam millis)
+   //   - dtUs = usNow - last    (precisao sub-ms para o IIR)
+   //   - PeriodicDeadline::poll(usNow) reusa este relogio.
+   // Assim, todas as decisoes da iteracao sao coerentes com o mesmo
+   // instante e nao ha drift entre tarefas.
+   const int64_t usNow = esp_timer_get_time();
+   const uint32_t ms   = (uint32_t)(usNow / 1000LL);
 
-   static uint32_t lastLoopStartUs = 0;
+   // Telemetria de jitter: dt entre inicios de loop (em us, 64 bits para
+   // nao haver wrap). Se passar de 12 ms, conta um "slow loop".
+   static int64_t lastLoopUs = 0;
    static uint32_t loopDtMaxUsThisSec = 0;
    static uint32_t slowLoopOver12ms = 0;
-   const uint32_t loopStartUs = micros();
-   if (lastLoopStartUs != 0) {
-     const uint32_t dtUs = loopStartUs - lastLoopStartUs;
+   if (lastLoopUs != 0) {
+     const int64_t dtUs64 = usNow - lastLoopUs;
+     const uint32_t dtUs = (dtUs64 > 0 && dtUs64 < 0x7FFFFFFFLL) ? (uint32_t)dtUs64 : 0u;
      if (dtUs > loopDtMaxUsThisSec)
        loopDtMaxUsThisSec = dtUs;
      if (dtUs > 12000u)
        slowLoopOver12ms++;
    }
-   lastLoopStartUs = loopStartUs;
 
-   static uint32_t lastLoopMs = ms;
-   const float dtSec = fmaxf((ms - lastLoopMs) / 1000.0f, 0.0005f);
-   lastLoopMs = ms;
+   // dtSec calculado em US para precisao sub-ms no filtro IIR de
+   // velocidade. Antes era em ms inteiros, perdendo ate 999us de
+   // resolucao por iteracao -> agora cada loop cycle conta exato.
+   const int64_t dtUsForFilter = (lastLoopUs == 0) ? 1000LL : (usNow - lastLoopUs);
+   lastLoopUs = usNow;
+   const float dtSec = fmaxf((float)dtUsForFilter / 1.0e6f, 0.0005f);
 
    gObd.pollReceive(ms);
    gObd.trySendRequests(ms);
@@ -773,15 +862,21 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      tInit = true;
    }
 
-   const bool tick10ms = t10.poll();
+   const bool tick10ms = t10.poll(usNow);
    if (tick10ms)
      gPanelCache.addSample(kmhFilt, ms);
 
-  const float kmhPanelRaw = gPanelCache.outputForCan(kmhFilt, ms);
-  const float kmhPanel = oemAntiDropPanelKmh(kmhPanelRaw, dtSec, ms);
-  const float kmhCan = speedForAbsCan(kmhPanel);
-   const float kmhAbsTx = slewLimitAbsCan(kmhCan, dtSec, gSpeed.haveObdEver(), gSpeed.zeroRunCount(),
-                                          gSpeed.heldRawKmh(), kmhPanel);
+   const float kmhPanelRaw = gPanelCache.outputForCan(kmhFilt, ms);
+   const float kmhPanel    = oemAntiDropPanelKmh(kmhPanelRaw, dtSec, ms);
+   const float kmhCan      = speedForAbsCan(kmhPanel);
+   const float kmhAbsTx    = slewLimitAbsCan(kmhCan, dtSec, gSpeed.haveObdEver(),
+                                             gSpeed.zeroRunCount(),
+                                             gSpeed.heldRawKmh(), kmhPanel);
+
+   // Velocidade ESCALADA (somente para frames lidos pelo painel/cluster).
+   // Nao afeta o odometro: gOdo.integrate usa kmhAbsTx puro -> 100 km no
+   // GPS = 100 km no hodometro, independente do fator do painel.
+   const float kmhPanelTx = fmaxf(0.0f, kmhAbsTx * kConfig.speedPanelScaleFactor);
 
    const float kmhOdo = effectiveSpeedKmhForOdo(kmhAbsTx);
 
@@ -797,54 +892,77 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
    if (tick10ms) {
      sZeit = uint16_t(sZeit + 10);
-     buildBremse1(b1, kmhAbsTx);
-     buildBremse3(b3, kmhAbsTx);
-     if (!sendFrame(kIdBremse1, b1))
+     // Bremse_1 e Bremse_3 vao ESCALADOS: o painel mostrara ~103 quando
+     // o GPS estiver em 100 (overshoot OEM). Bremse_2 (mid-rev, ABS
+     // interno) usa kmhAbsTx puro.
+     buildBremse1(b1, kmhPanelTx);
+     buildBremse3(b3, kmhPanelTx);
+     // Zaehler so incrementa se o frame foi efetivamente enfileirado
+     // para TX. Se falhar, mesmo counter sera reusado no proximo ciclo.
+     if (sendFrame(kIdBremse1, b1))
+       gBr1Zaehler = uint8_t((gBr1Zaehler + 1u) & 0x0Fu);
+     else
        txFail1A0++;
-     if (!sendFrame(kIdBremse3, b3))
+     if (!sendFrame(kIdBremse3, b3))  // Bremse_3 nao tem counter no DBC
        txFail4A0++;
-     gBr1Zaehler = uint8_t((gBr1Zaehler + 1u) & 0x0Fu);
    }
 
-   if (t20.poll()) {
+   if (t20.poll(usNow)) {
      uint16_t wvl, wvr, whl, whr;
      gOdo.weg10Wheels(&wvl, &wvr, &whl, &whr);
      buildBremse2(b2, kmhAbsTx, sZeit, gOdo.weg11FrontAxle(), gOdo.impulszahlForBremse2());
      buildBremse10(b10, wvl, wvr, whl, whr);
-     if (!sendFrame(kIdBremse2, b2))
+     if (!sendFrame(kIdBremse2, b2))  // Bremse_2 nao tem counter
        txFail5A0++;
-     if (!sendFrame(kIdBremse10, b10))
+     if (sendFrame(kIdBremse10, b10))
+       gB10Zaehler = uint8_t((gB10Zaehler + 1u) & 0x0Fu);
+     else
        txFail3A0++;
-    gB10Zaehler = uint8_t((gB10Zaehler + 1u) & 0x0Fu);
 
-    if (kConfig.emitCompanionEspFrames) {
-      uint8_t b5[8], b8[8], mob[6], b6[3], b11[8];
-      buildBremse5Idle(b5);
-      buildBremse8Idle(b8);
-      buildMotorBremseIdle(mob);
-      buildBremse6Idle(b6);
-      buildBremse11Idle(b11);
-      if (!sendFrame(kIdBremse5, b5))
-        txFailEsp++;
-      if (!sendFrame(kIdBremse8, b8))
-        txFailEsp++;
-      if (!sendFrameDlc(kIdMotorBremse, mob, 6))
-        txFailEsp++;
-      if (!sendFrameDlc(kIdBremse6, b6, 3))
-        txFailEsp++;
-      if (!sendFrame(kIdBremse11, b11))
-        txFailEsp++;
-      if (kConfig.emitBremse4HaldexFrame) {
-        const uint8_t b4[3] = {0, 0, 0};
-        if (!sendFrameDlc(kIdBremse4, b4, 3))
-          txFailEsp++;
-      }
-    }
-  }
+     if (kConfig.emitCompanionEspFrames) {
+       uint8_t b5[8], b8[8], b6[3], b11[8];
+       const bool stillstand = (kmhAbsTx < 1.0f);
+       buildBremse5Idle(b5, stillstand);
+       buildBremse8Idle(b8);
+       buildBremse6Idle(b6);
+       buildBremse11Idle(b11);
+       if (sendFrame(kIdBremse5, b5))
+         gBr5Zaehler = uint8_t((gBr5Zaehler + 1u) & 0x0Fu);
+       else
+         txFailEsp++;
+       if (sendFrame(kIdBremse8, b8))
+         gBr8Zaehler = uint8_t((gBr8Zaehler + 1u) & 0x0Fu);
+       else
+         txFailEsp++;
+       if (sendFrameDlc(kIdBremse6, b6, 3))
+         gBr6Zaehler = uint8_t((gBr6Zaehler + 1u) & 0x0Fu);
+       else
+         txFailEsp++;
+       if (sendFrame(kIdBremse11, b11))
+         gBr11Zaehler = uint8_t((gBr11Zaehler + 1u) & 0x0Fu);
+       else
+         txFailEsp++;
+       if (kConfig.emitBremse4HaldexFrame) {
+         uint8_t b4[3];
+         buildBremse4Idle(b4);
+         if (!sendFrameDlc(kIdBremse4, b4, 3))  // Bremse_4 nao tem counter
+           txFailEsp++;
+       }
+     }
+   }
 
-   static uint32_t lastLog = 0;
-   if (ms - lastLog > 1000) {
-     lastLog = ms;
+   esp_task_wdt_reset();
+
+   // Log 1Hz baseado em us (int64_t -> sem wrap). Robusto e coerente com
+   // o relogio capturado no inicio do loop.
+   static int64_t lastLogUs = 0;
+   if (usNow - lastLogUs > 1000000LL) {
+     lastLogUs = usNow;
+
+     const uint32_t heapFree = esp_get_free_heap_size();
+     const uint32_t heapMin  = esp_get_minimum_free_heap_size();
+     const uint32_t stackWM  = uxTaskGetStackHighWaterMark(NULL);
+
      Serial.print(F("loop dt max(ms)/>12ms: "));
      Serial.print(loopDtMaxUsThisSec / 1000.0f, 2);
      Serial.print('/');
@@ -852,14 +970,16 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      Serial.print(F(" | "));
      loopDtMaxUsThisSec = 0;
      slowLoopOver12ms = 0;
-    Serial.print(F("km/h filt/panel0/panel/CANtx/odo: "));
-    Serial.print(kmhFilt, 1);
-    Serial.print('/');
-    Serial.print(kmhPanelRaw, 1);
-    Serial.print('/');
-    Serial.print(kmhPanel, 1);
+     Serial.print(F("km/h filt/panel0/panel/CANtx/panelTx/odo: "));
+     Serial.print(kmhFilt, 1);
+     Serial.print('/');
+     Serial.print(kmhPanelRaw, 1);
+     Serial.print('/');
+     Serial.print(kmhPanel, 1);
      Serial.print('/');
      Serial.print(kmhAbsTx, 1);
+     Serial.print('/');
+     Serial.print(kmhPanelTx, 1);
      Serial.print('/');
      Serial.print(kmhOdo, 1);
      Serial.print(F(" | impulsos: "));
@@ -868,21 +988,28 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      Serial.print(effectiveImpulsesPerKm(), 1);
      Serial.print(F(" | RX buf: "));
      Serial.println(gCan.receiveBufferCount());
-    Serial.print(F("Motion RPM/wahl/eg: "));
-    Serial.print(gVehicleMotion.motorRpm, 0);
-    Serial.print('/');
-    Serial.print(gVehicleMotion.wahlPos, DEC);
-    Serial.print('/');
-    Serial.print(gVehicleMotion.engagedGear, DEC);
-    Serial.print(F(" | TX fail 1A0/4A0/5A0/3A0/esp: "));
+     Serial.print(F("Cambio wahl/eg: "));
+     Serial.print(gVehicleMotion.wahlPos, DEC);
+     Serial.print('/');
+     Serial.print(gVehicleMotion.engagedGear, DEC);
+     Serial.print(F(" | heap free/min: "));
+     Serial.print(heapFree);
+     Serial.print('/');
+     Serial.print(heapMin);
+     Serial.print(F(" | stack: "));
+     Serial.print(stackWM);
+     Serial.print(F(" | TX fail 1A0/4A0/5A0/3A0/esp: "));
      Serial.print(txFail1A0);
      Serial.print('/');
      Serial.print(txFail4A0);
      Serial.print('/');
      Serial.print(txFail5A0);
      Serial.print('/');
-    Serial.print(txFail3A0);
-    Serial.print('/');
-    Serial.println(txFailEsp);
+     Serial.print(txFail3A0);
+     Serial.print('/');
+     Serial.println(txFailEsp);
+
+     if (stackWM < 512u)
+       Serial.println(F("[WARN] Stack baixa!"));
    }
  }
