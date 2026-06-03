@@ -79,7 +79,3 @@ IDs and overview: [`docs/CAN_PQ35.md`](docs/CAN_PQ35.md) · DBC: [`docs/vw_pq.db
 
 MIT — see [`LICENSE`](LICENSE).
 
----
-
-- **v1.2.2** — INT GPIO 4, 1.2 pipeline, lite/full variants
-- **v1.2.3** — English docs and portal UI
