@@ -1,0 +1,40 @@
+# K-Matrix PQ35_46_ACAN (V5.20.6F) - ABS Bypass Emulator
+
+Esta tabela reproduz a estrutura exata do PDF oficial da Engenharia da VW (K-Matrix). Foram filtrados apenas os dados do Módulo ABS/ESP necessários para o Bypass. Os cabeçalhos originais alemães foram traduzidos para o Português para facilitar o entendimento, e adicionamos uma coluna extra de "Comentários" para orientar a programação do código em C++ (ESP32 / Arduino).
+
+## Tabela de Sinais (Signalmatrix)
+
+| Mensagem      | ID [hex] | Intervalo [ms] | Nome do Sinal          | Byte Inicial | Bit Inicial | Tamanho (bits) | Valor Padrão [dez] | Comentário (Emulação ESP32)                                                                            |
+| :------------ | :------: | :------------: | :--------------------- | :----------: | :---------: | :------------: | :----------------: | :----------------------------------------------------------------------------------------------------- |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_Checksumme**     |      1*      |      0      |       8        |         -          | Calculado no ultimo passo: calcChecksum_XOR. Corresponde ao data[0].                                   |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_ASR_Anf**        |      1*      |      0      |       1        |         0          | Bit de acao do ASR. Padrao: Manter em 0.                                                               |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_MSR_Anf**        |      1*      |      1      |       1        |         0          | Bit de acao do MSR. Padrao: Manter em 0.                                                               |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_ABS_Brems**      |      1*      |      2      |       1        |         0          | Bit de intervencao de ABS. Padrao: Manter em 0.                                                        |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_EDS_Eingr**      |      1*      |      3      |       1        |         0          | Bit de intervencao do Bloqueio. Padrao: Manter em 0.                                                   |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_ESP_Eingr**      |      1*      |      4      |       1        |         0          | Bit de alerta ativo do ESP. Se diferente de 0, derruba o ponteiro. Padrao: Manter em 0.                |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_EBV_Eingr**      |      1*      |      7      |       1        |         0          | Bit de ativacao EBV. Padrao: Manter em 0.                                                              |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_Rad_kmh**        |      3*      |      1      |      15        |         0          | Velocidade: uint16_t v = speed * 100. Bits divididos entre data[2] e data[3].                          |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_Zaehler**        |      8*      |      0      |       4        |         -          | Contador vivo do pacote (0 a 15) no data[7].                                                           |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_ASR_ESP**        |      8*      |      4      |       1        |         -          | Enviar bit 1 (0x10) para confirmar modulo ESP presente.                                                |
+| **mBremse_1** | `0x1A0`  |       10       | **BR1_Sta_ESP**        |      8*      |      6      |       1        |         0          | Enviar bit 1 (0x40) para validar saude do ESP.                                                         |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_Querbeschl**     |      1*      |      0      |       8        |         0          | Aceleracao Transversal. Padrao em reta: 0.                                                             |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_mi_Radgeschw**   |      2*      |      1      |      15        |         0          | Velocidade do Visor. Mesma formula do BR1_Rad_kmh.                                                     |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_Lampe_ABS**      |      4*      |      0      |       1        |         1          | Manda Injetar/Apagar a luz de freio/ABS no painel. Apagada = 1.                                        |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_Lampe_BK**       |      4*      |      2      |       1        |         1          | Manda Injetar/Apagar a luz Red Brake. Apagada = 1.                                                     |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_Zaehler**        |      4*      |      4      |       4        |         -          | Contador deslocado << 4 no data[3]. Usa junto as Lampes acima: Padrao 0x05.                            |
+| **mBremse_2** | `0x5A0`  |       20       | **BR2_Wegimpulse**     |      7*      |      0      |      11        |         0          | Hodometro pulsante, divididos entre data[6] e data[7].                                                 |
+| **mBremse_3** | `0x4A0`  |       10       | **BR3_Rad_kmh_VL**     |      1*      |      1      |      15        |         0          | Velocidade roda FL. data[0] e data[1].                                                                 |
+| **mBremse_3** | `0x4A0`  |       10       | **BR3_Rad_kmh_VR**     |      3*      |      1      |      15        |         0          | Velocidade roda FR. data[2] e data[3].                                                                 |
+| **mBremse_3** | `0x4A0`  |       10       | **BR3_Rad_kmh_HL**     |      5*      |      1      |      15        |         0          | Velocidade roda RL. data[4] e data[5].                                                                 |
+| **mBremse_3** | `0x4A0`  |       10       | **BR3_Rad_kmh_HR**     |      7*      |      1      |      15        |         0          | Velocidade roda RR. data[6] e data[7].                                                                 |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Giergeschw**     |      1*      |      0      |      14        |         0          | Velocidade angular (Yaw). Padrao Reta: 0.                                                              |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Sta_Gierrate**   |      2*      |      6      |       1        |         1          | Confirmar integridade Yaw na ECU (0x40 no data[1]).                                                    |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Bremsdruck**     |      3*      |      0      |      12        |         0          | Pressao de frenagem virtual (Cruise Control usa). Ativo: 0x0400.                                       |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Druckgueltig**   |      4*      |      5      |       1        |         1          | Validade do sensor de Pressao (0x20 no data[3]).                                                       |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Bremslicht**     |      6*      |      3      |       1        |         0          | Status do gatilho do Switch de freio. Crucial Cruise Control. Ativo: 0x08 no data[5].                  |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Zaehler**        |      7*      |      4      |       4        |         -          | Contador deslocado << 4 no data[6].                                                                    |
+| **mBremse_5** | `0x4A8`  |       10       | **BR5_Checksumme**     |      8*      |      0      |       8        |         -          | Calculado no ultimo passo: calcChecksum_XOR_Custom. Corresponde ao data[7].                            |
+
+---
+**Legenda do Leitor:**
+- **Byte Inicial\***: Os arquivos DBC/XLS do Grupo Volkswagen frequentemente contam "StartByte" começando em `1`. Isso quer dizer que na Tabela acima, se o documento diz "Byte 1", na matriz do código C++ será o index `data[0]`. Se diz "Byte 8", no nosso código será `data[7]`.
