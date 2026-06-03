@@ -32,19 +32,6 @@ Flash the `.bin` over USB and drive. Serial **115200**: `MK60 PQ35 ABS 1.2.3-lit
 
 ---
 
-## Changes vs 1.1 (previous repo)
-
-| | **1.1** | **1.2.x** |
-|---|---------|-----------|
-| MCP2515 INT | GPIO **2** | GPIO **4** (avoids boot LED conflict) |
-| Speed pipeline | Basic | Panel cache, slew, panel factor ~1.084 |
-| Wi‑Fi | No | Optional (**full**) |
-| Portal / status | — | **full** only |
-
-If your board still has INT on **GPIO 2** and 1.1 worked, you **do not need to upgrade** — or rewire INT to **GPIO 4** for 1.2.x.
-
----
-
 ## Warnings
 
 - **Does not restore ABS braking** — CAN messages only.
@@ -56,8 +43,6 @@ If your board still has INT on **GPIO 2** and 1.1 worked, you **do not need to u
 ## Hardware
 
 - ESP32 + MCP2515 + TJA1050, **8 MHz** crystal
-- MCP2515 INT → **GPIO 4** (not GPIO 2)
-- **5 V ≥ 1 A** on VIN
 - Remove **120 Ω jumper (J1)** on the MCP module in the car
 
 Details: [`docs/HARDWARE.md`](docs/HARDWARE.md)
@@ -69,13 +54,6 @@ Details: [`docs/HARDWARE.md`](docs/HARDWARE.md)
 ### Prebuilt binary
 
 [`docs/USB_FLASH.md`](docs/USB_FLASH.md)
-
-### Build from source
-
-```bash
-./scripts/setup-dev.sh
-./scripts/build.sh all    # builds lite + full into releases/
-```
 
 Requirements: Arduino CLI, ESP32 core 3.x, **ACAN2515** library.
 
@@ -103,8 +81,5 @@ MIT — see [`LICENSE`](LICENSE).
 
 ---
 
-## History
-
-- **v1.1** — minimal CAN-only firmware, INT GPIO 2
 - **v1.2.2** — INT GPIO 4, 1.2 pipeline, lite/full variants
 - **v1.2.3** — English docs and portal UI
