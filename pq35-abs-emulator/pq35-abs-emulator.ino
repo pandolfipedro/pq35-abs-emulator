@@ -1,14 +1,6 @@
-//  +------------------+----------+---------+---------------------------------+
-//  | MCP2515          |  GPIO    |  Sinal  |  Observacao                     |
-//  +------------------+----------+---------+---------------------------------+
-//  |  VCC             |  +5V     |  ---    |  modulo tem regulador 3V3 onbd  |
-//  |  GND             |  GND     |  ---    |                                 |
-//  |  CS              |  GPIO 5  |  SPI_SS |  kConfig.mcpCs                  |
-//  |  SCK             |  GPIO 18 |  SPI_CK |  HSPI/VSPI default do ESP32     |
-//  |  MOSI / SI       |  GPIO 23 |  SPI_MO |  HSPI/VSPI default do ESP32     |
-//  |  MISO / SO       |  GPIO 19 |  SPI_MI |  HSPI/VSPI default do ESP32     |
-//  |  INT             |  GPIO 4  |  IRQ    |  kConfig.mcpInt                 |
-//  +------------------+----------+---------+---------------------------------+
+// MK60EC1 PQ35 v2.0.0 — emulador ABS (ESP32 + MCP2515) — CAN only
+// OBD 0x7E1->0x7E9 PID 0D | Cambio 0x440/0x540 | CAN 500 kbit/s
+// MCP2515: CS=5 INT=4 | SPI SCK=18 MISO=19 MOSI=23
 
 #include <Arduino.h>
 #include <esp_timer.h>
@@ -19,31 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <ACAN2515.h>
-#include "VehicleStatusLite.h"
 
-// Build variant (lite vs full):
-//
-//   lite  — CAN only, no Wi-Fi (default below)
-//   full  — hidden AP + live status portal + local OTA
-//
-// Arduino IDE (manual flash):
-//   Change the line below to:  #define PQ35_WIFI_PORTAL 1   (full)
-//   Or leave as 0 for lite.
-
-#ifndef PQ35_WIFI_PORTAL
-#define PQ35_WIFI_PORTAL 0
-#endif
-
-#if PQ35_WIFI_PORTAL
-#include "WebPortal.h"
-#endif
-
-#define FIRMWARE_VERSION "1.2.3"
-#if PQ35_WIFI_PORTAL
-#define FIRMWARE_VARIANT "full"
-#else
-#define FIRMWARE_VARIANT "lite"
-#endif
 
 static constexpr uint32_t kWdtTimeoutMs = 2000;
 
@@ -107,14 +75,13 @@ static constexpr uint16_t kIdBremse11  = 0x5B7;
 static constexpr uint16_t kIdGetriebe1 = 0x440;
 static constexpr uint16_t kIdGetriebe2 = 0x540;
 
- static ACAN2515 gCan(kConfig.mcpCs, SPI, kConfig.mcpInt);
+// Aceleracoes neutras (vw_pq.dbc) — evita ABS/ESP falso no painel
+static constexpr uint8_t  kBr2QuerNeutral = 127;   // Bremse_2 lateral 0 g
+static constexpr uint8_t  kBr8TolNeutral  = 127;   // Bremse_8 tol. HL/HR 0 %
+static constexpr uint16_t kBr8LatNeutral  = 361;   // Bremse_8 lateral 0 m/s2
+static constexpr uint16_t kBr8LongNeutral = 512;   // Bremse_8 longitudinal 0 m/s2
 
- static bool gMcpOk = false;
- static uint32_t gTxFail1A0 = 0;
- static uint32_t gTxFail4A0 = 0;
- static uint32_t gTxFail5A0 = 0;
- static uint32_t gTxFail3A0 = 0;
- static uint32_t gTxFailEsp = 0;
+static ACAN2515 gCan(kConfig.mcpCs, SPI, kConfig.mcpInt);
 
  static inline uint32_t nowMillis() {
    return (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -186,20 +153,7 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
    return filteredKmh;
  }
 
- // Agendador rate-monotonic em microssegundos.
- //
- // Doutrina: a proxima "deadline" e calculada a partir da deadline anterior
- // (nextUs += periodUs), NAO a partir do "agora". Assim, se a iteracao
- // atrasou X us, a proxima espera fica X us mais curta -> a cadencia media
- // do periodo permanece exata, sem drift. Se o atraso passar de
- // kConfig.maxScheduleSlipUs (sistema travou ou houve um burst), reagenda
- // a partir de "agora" para evitar disparar varios ticks atrasados de uma
- // vez (anti burst-catch).
- //
- // poll(usNow): aceita opcionalmente o "agora" da iteracao para reusar
- // uma unica leitura de esp_timer_get_time() em todo o loop principal,
- // garantindo que tarefas concorrentes ancoradas no mesmo instante
- // disparem coerentemente.
+ // Agendador periodico (rate-monotonic, anti burst-catch).
  struct PeriodicDeadline {
    int64_t nextUs = 0;
    const int32_t periodUs;
@@ -228,10 +182,6 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
    }
  };
 
- // ============================================================
- // SpeedModel: pipeline de filtro IIR + tolerancia a zeros do OBD.
- // Inalterado em relacao a versao funcional 100%.
- // ============================================================
  struct SpeedModel {
    float filteredKmh = 0.0f;
    float heldKmh = 0.0f;
@@ -306,11 +256,6 @@ static constexpr uint16_t kIdGetriebe2 = 0x540;
 
  static SpeedModel gSpeed;
 
- // ============================================================
- // VehicleMotionFromCan: agora le APENAS Getriebe1/2 (cambio).
- // Motor1 (0x280, RPM) foi removido a pedido. motionDrivingOem
- // baseia-se SOMENTE em wahlPos / engagedGear.
- // ============================================================
 struct VehicleMotionFromCan {
   uint8_t wahlPos = 0xFF;
   uint32_t lastGearMs = 0;
@@ -345,8 +290,6 @@ struct VehicleMotionFromCan {
   }
   bool hasEngagedForwardGear() const { return engagedGear >= 1u && engagedGear <= 6u; }
 
-  // Sem RPM, "movimento OEM" passa a ser: marcha em D/R ou marcha
-  // engatada (1-6) reportada pelo Getriebe2. Em Park retorna false.
   bool motionDrivingOem(uint32_t nowMs) const {
     if (gearFresh(nowMs) && isPark())
       return false;
@@ -372,7 +315,7 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
     sLast = panelIn;
     return panelIn;
   }
-  const float maxStepDown = kConfig.motionAntiDropMaxKmhPerS * dtSec;
+  const float maxStepDown = kConfig.motionAntiDropMaxKmhPerS * fmaxf(dtSec, 0.002f);
   float out = panelIn;
   if (panelIn < sLast - maxStepDown)
     out = sLast - maxStepDown;
@@ -382,10 +325,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
   return out;
 }
 
- // ============================================================
- // SpeedPanelCache: janela de 5 amostras com rejeicao de outliers.
- // Inalterado em relacao a versao funcional 100%.
- // ============================================================
  struct SpeedPanelCache {
    static constexpr unsigned kN = 5;
    float window[kN] = {};
@@ -432,8 +371,7 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      if (cnt > 0) {
        lastAvg = sum / float(cnt);
      } else {
-       if (kConfig.useMotionCanFusion && gVehicleMotion.motionDrivingOem(nowMs) && mx > 0.0001f &&
-           haveAvg) {
+       if (kConfig.useMotionCanFusion && gVehicleMotion.motionDrivingOem(nowMs) && haveAvg) {
          // mantem lastAvg
        } else {
          lastAvg = 0.0f;
@@ -500,9 +438,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    *hr = uint16_t((q + (r > 3u ? 1u : 0u)) & 0x3FFu);
  }
 
- // ============================================================
- // Odometer: contagem de pulsos. Inalterado.
- // ============================================================
  struct Odometer {
    double impulseFrac = 0.0;
    uint32_t vehImpulses = 0;
@@ -537,7 +472,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      splitVehicleImpToWheels(vehImpulses, vl, vr, hl, hr);
    }
 
-   uint32_t totalImpulsesForLogging() const { return vehImpulses; }
  };
 
  static Odometer gOdo;
@@ -556,12 +490,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    return false;
  }
 
- // ============================================================
- // ObdClient
- //   - Pergunta SO para a transmissao (0x7E1) e aceita SO 0x7E9.
- //   - Auto-mute em Park: nada na rede CAN com o carro parado, libera
- //     o canal de diagnostico para o VCDS conversar com o cambio.
- // ============================================================
  struct ObdClient {
    uint32_t lastTxMs = 0;
 
@@ -629,9 +557,7 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      writeBitsLE(d, 40, 8, 0xFE);
      writeBitsLE(d, 48, 8, 0xFE);
    }
-   writeBitsLE(d, 16, 1, 1); // BR1_BKV_active: booster presente
    writeBitsLE(d, 56, 4, gBr1Zaehler & 0x0Fu);
-   writeBitsLE(d, 60, 1, 1); // BR1_ASR_ESP: modulo ASR/ESP/MABS (MK60EC1)
    writeBitsLE(d, 63, 1, 0);
  }
 
@@ -653,9 +579,8 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
  static void buildBremse2(uint8_t *d, float kmh, uint16_t zeitTicks, uint16_t weg11, uint8_t imp6) {
    memset(d, 0, 8);
-
    writeBitsLE(d, 8, 1, 1);
-   d[0] = 250;
+   writeBitsLE(d, 0, 8, kBr2QuerNeutral);
 
    const float mid = kmhToMidRevs(kmh);
    const uint16_t rawMid = uint16_t(midRevsToRaw(mid) & 0x7FFFu);
@@ -695,19 +620,8 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    d[0] = x;
  }
 
- // Builders dos companion frames: APENAS montam o frame. O incremento do
- // Zaehler e feito no caller, somente quando tryToSend() retornar true.
- // Razao: gateway PQ35 detecta "frame perdido" quando ve o counter pular.
- // Se a TX falhar, o frame nao foi pro bus, entao reusar o mesmo counter
- // na proxima tentativa e o comportamento correto.
-
- // Bremse_5 idle. Se stillstand=true, sinaliza BR5_Stillstand (bit 28) =1
- // -> Autohold/HSA/EPB reconhecem corretamente o estado de parada.
  static void buildBremse5Idle(uint8_t *d, bool stillstand) {
    memset(d, 0, 8);
-   writeBitsLE(d, 14, 1, 1); // BR5_Sta_Gierrate: yaw valido
-   writeBitsLE(d, 29, 1, 1); // BR5_Druckvalid: pressao valida
-   writeBitsLE(d, 30, 1, 1); // BR5_Sta_Druck: status pressao ok
    if (stillstand) writeBitsLE(d, 28, 1, 1);
    writeBitsLE(d, 52, 4, uint32_t(gBr5Zaehler & 0x0Fu));
    uint8_t x = 0;
@@ -716,19 +630,13 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    d[7] = x;
  }
 
- // Bremse_8 idle. Aceleracoes neutras (0 m/s^2):
- //   BR8_Istbeschl   (bit 32, 9, scale 0.02,    offset -7.22) -> raw 361
- //   BR8_Laengsbeschl(bit 48, 10, scale 0.03125, offset -16)  -> raw 512
- // Sem isso, raw 0 representa -7.22 / -16 m/s^2 (frenagem violenta) e
- // pode confundir o painel/ESP companion.
  static void buildBremse8Idle(uint8_t *d) {
    memset(d, 0, 8);
    writeBitsLE(d, 8, 4, uint32_t(gBr8Zaehler & 0x0Fu));
-   writeBitsLE(d, 15, 1, 1);    // BR8_Sta_Br_Druck: status pressao ok
-   writeBitsLE(d, 16, 8, 127u); // BR8_TolAbgl_HL: 0% neutro
-   writeBitsLE(d, 24, 8, 127u); // BR8_TolAbgl_HR: 0% neutro
-   writeBitsLE(d, 32, 9, 361u);
-   writeBitsLE(d, 48, 10, 512u);
+   writeBitsLE(d, 16, 8, kBr8TolNeutral);
+   writeBitsLE(d, 24, 8, kBr8TolNeutral);
+   writeBitsLE(d, 32, 9, kBr8LatNeutral);
+   writeBitsLE(d, 48, 10, kBr8LongNeutral);
    uint8_t x = 0;
    for (int i = 1; i < 8; ++i)
      x ^= d[i];
@@ -738,7 +646,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
  static void buildBremse6Idle(uint8_t *d) {
    memset(d, 0, 3);
    writeBitsLE(d, 0, 10, 123u);
-   writeBitsLE(d, 11, 1, 1); // Status_Bremsdruck: pressao valida
    writeBitsLE(d, 12, 4, uint32_t(gBr6Zaehler & 0x0Fu));
    d[2] = uint8_t(d[0] ^ d[1]);
  }
@@ -746,16 +653,12 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
  static void buildBremse11Idle(uint8_t *d) {
    memset(d, 0, 8);
    writeBitsLE(d, 8, 4, uint32_t(gBr11Zaehler & 0x0Fu));
-   writeBitsLE(d, 33, 1, 1); // B11_EPB_Steller_gue: atuador EPB valido
    uint8_t x = 0;
    for (int i = 1; i < 8; ++i)
      x ^= d[i];
    d[0] = x;
  }
 
- // Bremse_4 idle (Haldex). ABS_Vorgabewert_mitte_Kupplungs (bit 0, 8,
- // scale 3, offset -381): raw 127 = 0 Nm/min (torque neutro). Outros
- // bytes ficam 0. DBC nao define counter pra este frame.
  static void buildBremse4Idle(uint8_t *d) {
    memset(d, 0, 3);
    d[0] = 127;
@@ -785,33 +688,7 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
  static void IRAM_ATTR canISR() { gCan.isr(); }
 
- static const __FlashStringHelper* resetReasonStr(esp_reset_reason_t r) {
-   switch (r) {
-     case ESP_RST_POWERON:  return F("POWERON");
-     case ESP_RST_EXT:      return F("EXT");
-     case ESP_RST_SW:       return F("SW");
-     case ESP_RST_PANIC:    return F("PANIC");
-     case ESP_RST_INT_WDT:  return F("INT_WDT");
-     case ESP_RST_TASK_WDT: return F("TASK_WDT");
-     case ESP_RST_WDT:      return F("WDT");
-     case ESP_RST_DEEPSLEEP:return F("DEEPSLEEP");
-     case ESP_RST_BROWNOUT: return F("BROWNOUT");
-     case ESP_RST_SDIO:     return F("SDIO");
-     default:               return F("UNKNOWN");
-   }
- }
-
  void setup() {
-   Serial.begin(115200);
-   delay(200);
-   Serial.print(F("MK60 PQ35 ABS "));
-   Serial.print(FIRMWARE_VERSION);
-   Serial.print(F("-"));
-   Serial.println(FIRMWARE_VARIANT);
-   Serial.println(F("cambio-only OBD | RX 440/540 | INT GPIO 4"));
-   Serial.print(F("Reset reason: "));
-   Serial.println(resetReasonStr(esp_reset_reason()));
-
    SPI.begin(18, 19, 23);
 
    ACAN2515Settings settings(kConfig.quartzHz, kConfig.canBitrate);
@@ -829,23 +706,14 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      err = gCan.begin(settings, canISR, rxm, rxm,
                       filters, uint8_t(sizeof(filters) / sizeof(filters[0])));
      if (err == 0) break;
-     Serial.print(F("ACAN2515 begin tentativa "));
-     Serial.print(attempt);
-     Serial.print(F(" falhou: 0x"));
-     Serial.println(err, HEX);
      delay(500);
    }
    if (err != 0) {
-     Serial.println(F("[FATAL] MCP2515 did not initialize. Restarting..."));
-     Serial.flush();
      delay(200);
      esp_restart();
    }
-   Serial.println(F("MCP2515 OK @ 500k"));
-   gMcpOk = true;
 
    gObd.setup();
-   vehicleStatusBegin();
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
    {
@@ -860,42 +728,13 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    esp_task_wdt_init(kWdtTimeoutMs / 1000u, true);
 #endif
    esp_task_wdt_add(NULL);
-
-#if PQ35_WIFI_PORTAL
-   webPortalBegin(FIRMWARE_VERSION, FIRMWARE_VARIANT);
-#else
-   Serial.println(F("Wi-Fi disabled (lite build)"));
-#endif
  }
 
  void loop() {
-   // Relogio de microssegundos capturado UMA UNICA VEZ por iteracao.
-   // Todos os subsistemas que precisam de "agora" derivam deste valor:
-   //   - ms   = usNow / 1000    (modulos legados que esperam millis)
-   //   - dtUs = usNow - last    (precisao sub-ms para o IIR)
-   //   - PeriodicDeadline::poll(usNow) reusa este relogio.
-   // Assim, todas as decisoes da iteracao sao coerentes com o mesmo
-   // instante e nao ha drift entre tarefas.
    const int64_t usNow = esp_timer_get_time();
    const uint32_t ms   = (uint32_t)(usNow / 1000LL);
 
-   // Telemetria de jitter: dt entre inicios de loop (em us, 64 bits para
-   // nao haver wrap). Se passar de 12 ms, conta um "slow loop".
    static int64_t lastLoopUs = 0;
-   static uint32_t loopDtMaxUsThisSec = 0;
-   static uint32_t slowLoopOver12ms = 0;
-   if (lastLoopUs != 0) {
-     const int64_t dtUs64 = usNow - lastLoopUs;
-     const uint32_t dtUs = (dtUs64 > 0 && dtUs64 < 0x7FFFFFFFLL) ? (uint32_t)dtUs64 : 0u;
-     if (dtUs > loopDtMaxUsThisSec)
-       loopDtMaxUsThisSec = dtUs;
-     if (dtUs > 12000u)
-       slowLoopOver12ms++;
-   }
-
-   // dtSec calculado em US para precisao sub-ms no filtro IIR de
-   // velocidade. Antes era em ms inteiros, perdendo ate 999us de
-   // resolucao por iteracao -> agora cada loop cycle conta exato.
    const int64_t dtUsForFilter = (lastLoopUs == 0) ? 1000LL : (usNow - lastLoopUs);
    lastLoopUs = usNow;
    const float dtSec = fmaxf((float)dtUsForFilter / 1.0e6f, 0.0005f);
@@ -926,9 +765,6 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
                                              gSpeed.zeroRunCount(),
                                              gSpeed.heldRawKmh(), kmhPanel);
 
-   // Velocidade ESCALADA (somente para frames lidos pelo painel/cluster).
-   // Nao afeta o odometro: gOdo.integrate usa kmhAbsTx puro -> 100 km no
-   // GPS = 100 km no hodometro, independente do fator do painel.
    const float kmhPanelTx = fmaxf(0.0f, kmhAbsTx * kConfig.speedPanelScaleFactor);
 
    const float kmhOdo = effectiveSpeedKmhForOdo(kmhAbsTx);
@@ -943,19 +779,11 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
 
    if (tick10ms) {
      sZeit = uint16_t(sZeit + 10);
-     // Bremse_1 e Bremse_3 vao ESCALADOS: o painel mostrara ~103 quando
-     // o GPS estiver em 100 (overshoot OEM). Bremse_2 (mid-rev, ABS
-     // interno) usa kmhAbsTx puro.
      buildBremse1(b1, kmhPanelTx);
      buildBremse3(b3, kmhPanelTx);
-     // Zaehler so incrementa se o frame foi efetivamente enfileirado
-     // para TX. Se falhar, mesmo counter sera reusado no proximo ciclo.
      if (sendFrame(kIdBremse1, b1))
        gBr1Zaehler = uint8_t((gBr1Zaehler + 1u) & 0x0Fu);
-     else
-       gTxFail1A0++;
-     if (!sendFrame(kIdBremse3, b3))  // Bremse_3 nao tem counter no DBC
-       gTxFail4A0++;
+     (void)sendFrame(kIdBremse3, b3);
    }
 
    if (t20.poll(usNow)) {
@@ -963,12 +791,9 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
      gOdo.weg10Wheels(&wvl, &wvr, &whl, &whr);
      buildBremse2(b2, kmhAbsTx, sZeit, gOdo.weg11FrontAxle(), gOdo.impulszahlForBremse2());
      buildBremse10(b10, wvl, wvr, whl, whr);
-     if (!sendFrame(kIdBremse2, b2))  // Bremse_2 nao tem counter
-       gTxFail5A0++;
+     (void)sendFrame(kIdBremse2, b2);
      if (sendFrame(kIdBremse10, b10))
        gB10Zaehler = uint8_t((gB10Zaehler + 1u) & 0x0Fu);
-     else
-       gTxFail3A0++;
 
      if (kConfig.emitCompanionEspFrames) {
        uint8_t b5[8], b8[8], b6[3], b11[8];
@@ -979,113 +804,19 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
        buildBremse11Idle(b11);
        if (sendFrame(kIdBremse5, b5))
          gBr5Zaehler = uint8_t((gBr5Zaehler + 1u) & 0x0Fu);
-       else
-         gTxFailEsp++;
        if (sendFrame(kIdBremse8, b8))
          gBr8Zaehler = uint8_t((gBr8Zaehler + 1u) & 0x0Fu);
-       else
-         gTxFailEsp++;
        if (sendFrameDlc(kIdBremse6, b6, 3))
          gBr6Zaehler = uint8_t((gBr6Zaehler + 1u) & 0x0Fu);
-       else
-         gTxFailEsp++;
        if (sendFrame(kIdBremse11, b11))
          gBr11Zaehler = uint8_t((gBr11Zaehler + 1u) & 0x0Fu);
-       else
-         gTxFailEsp++;
        if (kConfig.emitBremse4HaldexFrame) {
          uint8_t b4[3];
          buildBremse4Idle(b4);
-         if (!sendFrameDlc(kIdBremse4, b4, 3))  // Bremse_4 nao tem counter
-           gTxFailEsp++;
+         (void)sendFrameDlc(kIdBremse4, b4, 3);
        }
      }
    }
 
-   {
-     VehicleStatusLite vs;
-     vs.updatedMs = ms;
-     vs.speedFiltKmh = kmhFilt;
-     vs.speedPanelKmh = kmhPanelTx;
-     vs.speedCanTxKmh = kmhAbsTx;
-     vs.speedOdoKmh = kmhOdo;
-     vs.obdValid = gSpeed.haveObdEver();
-     vs.gearWahl = gVehicleMotion.wahlPos;
-     vs.gearEngaged = gVehicleMotion.engagedGear;
-     vs.gearValid = gVehicleMotion.gearFresh(ms);
-     vs.inPark = gVehicleMotion.gearFresh(ms) && gVehicleMotion.isPark();
-     vs.motionDriving = gVehicleMotion.motionDrivingOem(ms);
-     vs.odoImpulses = gOdo.totalImpulsesForLogging();
-     vs.impPerKm = effectiveImpulsesPerKm();
-     vs.rxBuf = (uint8_t)gCan.receiveBufferCount();
-     vs.txFail1A0 = gTxFail1A0;
-     vs.txFail4A0 = gTxFail4A0;
-     vs.txFail5A0 = gTxFail5A0;
-     vs.txFail3A0 = gTxFail3A0;
-     vs.txFailEsp = gTxFailEsp;
-     vs.mcpOk = gMcpOk;
-     vehicleStatusPublish(vs);
-   }
-
    esp_task_wdt_reset();
-
-   // Log 1Hz baseado em us (int64_t -> sem wrap). Robusto e coerente com
-   // o relogio capturado no inicio do loop.
-   static int64_t lastLogUs = 0;
-   if (usNow - lastLogUs > 1000000LL) {
-     lastLogUs = usNow;
-
-     const uint32_t heapFree = esp_get_free_heap_size();
-     const uint32_t heapMin  = esp_get_minimum_free_heap_size();
-     const uint32_t stackWM  = uxTaskGetStackHighWaterMark(NULL);
-
-     Serial.print(F("loop dt max(ms)/>12ms: "));
-     Serial.print(loopDtMaxUsThisSec / 1000.0f, 2);
-     Serial.print('/');
-     Serial.print(slowLoopOver12ms);
-     Serial.print(F(" | "));
-     loopDtMaxUsThisSec = 0;
-     slowLoopOver12ms = 0;
-     Serial.print(F("km/h filt/panel0/panel/CANtx/panelTx/odo: "));
-     Serial.print(kmhFilt, 1);
-     Serial.print('/');
-     Serial.print(kmhPanelRaw, 1);
-     Serial.print('/');
-     Serial.print(kmhPanel, 1);
-     Serial.print('/');
-     Serial.print(kmhAbsTx, 1);
-     Serial.print('/');
-     Serial.print(kmhPanelTx, 1);
-     Serial.print('/');
-     Serial.print(kmhOdo, 1);
-     Serial.print(F(" | impulsos: "));
-     Serial.print(gOdo.totalImpulsesForLogging());
-     Serial.print(F(" | imp/km: "));
-     Serial.print(effectiveImpulsesPerKm(), 1);
-     Serial.print(F(" | RX buf: "));
-     Serial.println(gCan.receiveBufferCount());
-     Serial.print(F("Cambio wahl/eg: "));
-     Serial.print(gVehicleMotion.wahlPos, DEC);
-     Serial.print('/');
-     Serial.print(gVehicleMotion.engagedGear, DEC);
-     Serial.print(F(" | heap free/min: "));
-     Serial.print(heapFree);
-     Serial.print('/');
-     Serial.print(heapMin);
-     Serial.print(F(" | stack: "));
-     Serial.print(stackWM);
-     Serial.print(F(" | TX fail 1A0/4A0/5A0/3A0/esp: "));
-     Serial.print(gTxFail1A0);
-     Serial.print('/');
-     Serial.print(gTxFail4A0);
-     Serial.print('/');
-     Serial.print(gTxFail5A0);
-     Serial.print('/');
-     Serial.print(gTxFail3A0);
-     Serial.print('/');
-     Serial.println(gTxFailEsp);
-
-     if (stackWM < 512u)
-       Serial.println(F("[WARN] Stack baixa!"));
-   }
  }
