@@ -1,13 +1,13 @@
 # PQ35 ABS Emulator (MK60EC1)
 
-Emulador CAN do **MK60EC1** para **VW PQ35/PQ46** — **ESP32 + MCP2515**.
+Open-source **MK60EC1** CAN emulator for **VW PQ35/PQ46** — **ESP32 + MCP2515**.
 
-Lê velocidade via OBD **0x7E1 → 0x7E9 PID 0x0D** (09G) e transmite frames `Bremse_*` para restaurar **velocímetro** e **odômetro** sem o ABS original.
+Reads speed via OBD **0x7E1 → 0x7E9 PID 0x0D** (09G TCU) and transmits `Bremse_*` frames to restore the **speedometer** and **odometer** without the original ABS module.
 
-**v2.0.0** · CAN only · sem Wi‑Fi · serial silencioso  
-**Testado:** Jetta 2.5 2009 · 09G · cluster PQ35
+**v2.0.0** · CAN only · no Wi‑Fi · silent serial  
+**Tested on:** Jetta 2.5 2009 · 09G · PQ35 cluster
 
-> **Não restaura frenagem ABS.** Apenas mensagens CAN. Use por sua conta e risco.
+> **Does not restore ABS braking.** CAN messages only. Use at your own risk.
 
 ---
 
@@ -21,48 +21,48 @@ Lê velocidade via OBD **0x7E1 → 0x7E9 PID 0x0D** (09G) e transmite frames `Br
 | SCK | 18 · MISO 19 · MOSI 23 |
 | INT | GPIO 4 |
 
-Cristal **8 MHz** · CAN **500 kbit/s** · remover jumper **120 Ω (J1)** do MCP · CAN H/L no barramento **Powertrain**.
+**8 MHz** crystal · **500 kbit/s** CAN · remove **120 Ω jumper (J1)** on the MCP module · connect CAN H/L to the **Powertrain** bus.
 
-Biblioteca: [ACAN2515](https://github.com/pierremolinaro/acan2515) · Core **ESP32 3.x**
+Library: [ACAN2515](https://github.com/pierremolinaro/acan2515) · **ESP32 3.x** core
 
 ---
 
-## Calibração
+## Calibration
 
-Editar struct `Config` no `.ino`:
+Edit the `Config` struct at the top of the `.ino`:
 
-| Parâmetro | Default | Uso |
-|-----------|---------|-----|
-| `speedPanelScaleFactor` | `1.084` | Agulha (Bremse_1/3). `1.0` = sem viés |
-| `odoImpulsesPerKmScale` | `0.2581` | Odômetro nos frames ABS |
-| `wheelCircumferenceM` | `1.985` | Bremse_2 mid-rev |
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `speedPanelScaleFactor` | `1.084` | Needle (Bremse_1/3). `1.0` = no bias |
+| `odoImpulsesPerKmScale` | `0.2581` | Odometer in ABS frames |
+| `wheelCircumferenceM` | `1.985` | Bremse_2 mid wheel speed |
 
 ---
 
 ## CAN
 
-| ID | Frame | Período |
-|----|-------|---------|
+| ID | Frame | Period |
+|----|-------|--------|
 | 0x1A0 / 0x4A0 | Bremse_1 / 3 | 10 ms |
 | 0x5A0 / 0x3A0 | Bremse_2 / 10 | 20 ms |
-| 0x4A8–0x5B7 | Companion ESP | 20 ms |
+| 0x4A8–0x5B7 | ESP companion | 20 ms |
 
 RX: OBD 0x7E9 · Getriebe 0x440 / 0x540
 
-Sinais DBC: [`docs/vw_pq.dbc`](docs/vw_pq.dbc)
+DBC signals: [`docs/vw_pq.dbc`](docs/vw_pq.dbc)
 
-**v2.0 — acelerações neutras:** Bremse_2 raw **127** · Bremse_8 **127 / 361 / 512** (evita luz ABS/ESP falsa)
+**v2.0 — neutral accelerations:** Bremse_2 raw **127** · Bremse_8 **127 / 361 / 512** (prevents false ABS/ESP warning light)
 
 ---
 
 ## Changelog v2.0.0
 
-- Firmware único em `pq35-abs-emulator/pq35-abs-emulator.ino`
-- Removido Wi‑Fi / portal / variantes lite-full
-- Corrigidas acelerações lateral e longitudinal (Bremse_2 e Bremse_8)
-- Serial silencioso
+- Single firmware file: `pq35-abs-emulator/pq35-abs-emulator.ino`
+- Removed Wi‑Fi / web portal / lite-full variants
+- Fixed lateral and longitudinal accelerations (Bremse_2 and Bremse_8)
+- Silent serial (no debug output)
 
-Versão anterior com Wi‑Fi: [v1.2.3](https://github.com/pandolfipedro/pq35-abs-emulator/releases/tag/v1.2.3)
+Previous Wi‑Fi build: [v1.2.3](https://github.com/pandolfipedro/pq35-abs-emulator/releases/tag/v1.2.3)
 
 ---
 
