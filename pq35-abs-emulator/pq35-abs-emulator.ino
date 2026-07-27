@@ -19,7 +19,7 @@ struct Config {
    bool odoDeriveImpulsesPerKm = true;
    float absDistanceImpulsesPerWheelRev = 43.0f;
    float impulsesPerKmCoding = 21960.0f;
-   float odoImpulsesPerKmScale = 0.2531f;
+   float odoImpulsesPerKmScale = 0.245f;
    float standstillDeadBandKmh = 2.0f;
    uint32_t obdRequestPeriodMs = 80;
    uint32_t obdTimeoutMs = 1500;
