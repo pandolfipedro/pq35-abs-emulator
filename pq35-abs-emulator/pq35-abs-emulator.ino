@@ -26,8 +26,8 @@ struct Config {
    uint32_t obdHoldMaxMs = 25000;
    float speedTauMs = 180.0f;
    float speedMaxDecayKmhPerS = 12.0f;
-   float absCanSlewUpKmhPerS = 220.0f;
-   float absCanSlewDownKmhPerS = 75.0f;
+   float absCanSlewUpKmhPerS = 250.0f;
+   float absCanSlewDownKmhPerS = 55.0f;
    uint16_t obdTransReq = 0x7E1;
    uint16_t obdTransRsp = 0x7E9;
    int32_t maxScheduleSlipUs = 3500;
@@ -42,7 +42,7 @@ struct Config {
    uint8_t gearWahlNeutral = 6;
    uint8_t gearWahlDrive = 5;
    bool motionAntiDropEnable = true;
-   float motionAntiDropMaxKmhPerS = 100.0f;
+   float motionAntiDropMaxKmhPerS = 75.0f;
    bool emitCompanionEspFrames = true;
    bool emitBremse4HaldexFrame = false;
    float speedPanelScaleFactor = 1.0f;
