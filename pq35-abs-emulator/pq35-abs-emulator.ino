@@ -27,7 +27,7 @@ struct Config {
    float speedTauMs = 180.0f;
    float speedMaxDecayKmhPerS = 12.0f;
    float absCanSlewUpKmhPerS = 250.0f;
-   float absCanSlewDownKmhPerS = 55.0f;
+   float absCanSlewDownKmhPerS = 50.0f;
    uint16_t obdTransReq = 0x7E1;
    uint16_t obdTransRsp = 0x7E9;
    int32_t maxScheduleSlipUs = 3500;
@@ -46,6 +46,15 @@ struct Config {
    bool emitCompanionEspFrames = true;
    bool emitBremse4HaldexFrame = false;
    float speedPanelScaleFactor = 1.0f;
+   // Aceleracao dinamica (G85 0xC2 + dv/dt)
+   float wheelbaseM = 2.578f;       // Jetta 2009
+   float steeringRatio = 15.7f;     // Gen3 tipico
+   uint32_t g85TimeoutMs = 500;
+   uint8_t g85StatusCalibrated = 2; // LW1_Status: 2 = OK / calibrado
+   float accelLongTauMs = 120.0f;
+   float accelLatTauMs = 80.0f;
+   float accelLongMaxMs2 = 8.0f;
+   float accelLatMaxMs2 = 8.0f;
 } kConfig;
 
 static inline float effectiveImpulsesPerKm() {
@@ -67,11 +76,17 @@ static constexpr uint16_t kIdBremse8   = 0x1AC;
 static constexpr uint16_t kIdBremse11  = 0x5B7;
 static constexpr uint16_t kIdGetriebe1 = 0x440;
 static constexpr uint16_t kIdGetriebe2 = 0x540;
-// Aceleracoes neutras (vw_pq.dbc) — evita ABS/ESP falso
+static constexpr uint16_t kIdLenkwinkel1 = 0x0C2; // G85 / Lenkwinkel_1
 static constexpr uint8_t kBr2QuerNeutral = 127;
 static constexpr uint8_t kBr8TolNeutral = 127;
 static constexpr uint16_t kBr8LatNeutral = 361;
 static constexpr uint16_t kBr8LongNeutral = 512;
+static constexpr float kGToMs2 = 9.81f;
+static constexpr uint8_t kAbsLogicalAddr = 0x03;
+static constexpr uint16_t kIdTp20Setup = 0x200;
+static constexpr uint16_t kIdTp20SetupRsp = 0x200u + kAbsLogicalAddr; // 0x203
+static constexpr uint16_t kTp20DefaultEcuTx = 0x300;
+static constexpr uint16_t kTp20DefaultEcuRx = 0x740;
 
  static ACAN2515 gCan(kConfig.mcpCs, SPI, kConfig.mcpInt);
 
@@ -292,6 +307,118 @@ struct VehicleMotionFromCan {
 
 static VehicleMotionFromCan gVehicleMotion;
 
+// G85 / Lenkwinkel_1 (0x0C2) — Gen3
+struct SteeringAngleFromCan {
+  float angleDeg = 0.0f;
+  uint8_t status = 0xFF;
+  uint32_t lastMs = 0;
+
+  void onLenkwinkel1(const CANMessage &m, uint32_t nowMs) {
+    if (m.rtr || m.len < 6)
+      return;
+    const uint32_t mag = readBitsLE(m.data, 0, 15);
+    const bool neg = readBitsLE(m.data, 15, 1) != 0;
+    float deg = float(mag) * 0.04375f;
+    if (neg)
+      deg = -deg;
+    angleDeg = deg;
+    status = uint8_t(readBitsLE(m.data, 41, 2) & 0x03u);
+    lastMs = nowMs;
+  }
+
+  bool fresh(uint32_t nowMs) const {
+    return lastMs != 0 && (nowMs - lastMs) < kConfig.g85TimeoutMs;
+  }
+
+  // Status 2 = calibrado/OK (padrao VAG LWS). Outros = neutro lateral.
+  bool calibrated(uint32_t nowMs) const {
+    return fresh(nowMs) && status == kConfig.g85StatusCalibrated;
+  }
+};
+
+static SteeringAngleFromCan gSteer;
+
+struct AccelEstimator {
+  float aLongMs2 = 0.0f;
+  float aLatMs2 = 0.0f;
+  float lastKmh = 0.0f;
+  bool haveSpeed = false;
+
+  void tick(float kmh, float dtSec, uint32_t nowMs) {
+    const float dt = fmaxf(dtSec, 0.001f);
+
+    if (haveSpeed) {
+      const float aInst = ((kmh - lastKmh) / 3.6f) / dt;
+      const float alphaL = (kConfig.accelLongTauMs <= 1.0f)
+                               ? 1.0f
+                               : (1.0f - expf(-dt * 1000.0f / kConfig.accelLongTauMs));
+      aLongMs2 += (aInst - aLongMs2) * alphaL;
+    } else {
+      aLongMs2 = 0.0f;
+    }
+    lastKmh = kmh;
+    haveSpeed = true;
+
+    float aLatTarget = 0.0f;
+    if (gSteer.calibrated(nowMs) && kConfig.wheelbaseM > 0.5f && kConfig.steeringRatio > 1.0f) {
+      const float v = kmh / 3.6f;
+      if (v > 0.8f) {
+        const float roadRad = (gSteer.angleDeg / kConfig.steeringRatio) * 0.01745329251f;
+        // modelo bicicleta: a = v^2 * tan(delta) / L
+        aLatTarget = (v * v * tanf(roadRad)) / kConfig.wheelbaseM;
+      }
+    }
+
+    const float alphaY = (kConfig.accelLatTauMs <= 1.0f)
+                             ? 1.0f
+                             : (1.0f - expf(-dt * 1000.0f / kConfig.accelLatTauMs));
+    if (!gSteer.calibrated(nowMs)) {
+      aLatMs2 = 0.0f; // forca neutro se G85 nao calibrado
+    } else {
+      aLatMs2 += (aLatTarget - aLatMs2) * alphaY;
+    }
+
+    aLongMs2 = fmaxf(-kConfig.accelLongMaxMs2, fminf(kConfig.accelLongMaxMs2, aLongMs2));
+    aLatMs2 = fmaxf(-kConfig.accelLatMaxMs2, fminf(kConfig.accelLatMaxMs2, aLatMs2));
+  }
+
+  static uint8_t br2QuerRawFromG(float g) {
+    // physical = raw*0.01 - 1.27
+    float raw = (g + 1.27f) / 0.01f;
+    if (raw < 0.0f)
+      raw = 0.0f;
+    if (raw > 255.0f)
+      raw = 255.0f;
+    return uint8_t(raw + 0.5f);
+  }
+
+  static uint16_t br8LatRawFromMs2(float a) {
+    // physical = raw*0.02 - 7.22
+    float raw = (a + 7.22f) / 0.02f;
+    if (raw < 0.0f)
+      raw = 0.0f;
+    if (raw > 511.0f)
+      raw = 511.0f;
+    return uint16_t(raw + 0.5f);
+  }
+
+  static uint16_t br8LongRawFromMs2(float a) {
+    // physical = raw*0.03125 - 16
+    float raw = (a + 16.0f) / 0.03125f;
+    if (raw < 0.0f)
+      raw = 0.0f;
+    if (raw > 1023.0f)
+      raw = 1023.0f;
+    return uint16_t(raw + 0.5f);
+  }
+
+  uint8_t br2QuerRaw() const { return br2QuerRawFromG(aLatMs2 / kGToMs2); }
+  uint16_t br8LatRaw() const { return br8LatRawFromMs2(aLatMs2); }
+  uint16_t br8LongRaw() const { return br8LongRawFromMs2(aLongMs2); }
+};
+
+static AccelEstimator gAccel;
+
 static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
   static float sLast = -1.0f;
   if (!kConfig.motionAntiDropEnable || !kConfig.useMotionCanFusion)
@@ -479,6 +606,269 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    return false;
  }
 
+ // --- TP2.0 + KWP2000 minimo (ABS addr 03) ---
+ // Responde ao gateway/scanner sem remover ABS da lista de instalacao.
+
+ struct AbsTp20Diag {
+   bool open = false;
+   uint16_t ecuTxId = kTp20DefaultEcuTx;
+   uint16_t ecuRxId = kTp20DefaultEcuRx;
+   uint8_t seqTx = 0;
+   uint32_t setupOkCount = 0;
+   uint32_t kwpOkCount = 0;
+
+   static constexpr uint8_t kEcuId91[] = {
+       '1', 'K', '0', '9', '0', '7', '3', '7', '9', ' ',
+       '0', '1', '4', '3',
+   };
+
+   void resetChannel() {
+     open = false;
+     seqTx = 0;
+   }
+
+   static uint16_t decodeCanId(uint8_t idLo, uint8_t vPref) {
+     const uint8_t pref = uint8_t(vPref & 0x0Fu);
+     return uint16_t((uint16_t(pref) << 8) | idLo);
+   }
+
+   static bool idValid(uint8_t vPref) { return (vPref & 0x10u) == 0; }
+
+   bool sendRaw(uint16_t id, const uint8_t *data, uint8_t len) {
+     CANMessage m;
+     memset(&m, 0, sizeof(m));
+     m.id = id;
+     m.len = (len > 8u) ? 8u : len;
+     m.ext = false;
+     m.rtr = false;
+     if (m.len)
+       memcpy(m.data, data, m.len);
+     return gCan.tryToSend(m);
+   }
+
+   void sendAck(uint8_t seq) {
+     uint8_t d[1] = {uint8_t(0xB0u | (seq & 0x0Fu))};
+     (void)sendRaw(ecuTxId, d, 1);
+   }
+
+   void sendChannelParamsRsp() {
+     uint8_t d[6] = {0xA1, 0x0F, 0x8A, 0xFF, 0x4A, 0xFF};
+     (void)sendRaw(ecuTxId, d, 6);
+   }
+
+   void sendTp20DataLast(const uint8_t *kwp, uint16_t kwpLen) {
+     if (kwpLen > 5) {
+       uint8_t first[8];
+       memset(first, 0, 8);
+       first[0] = uint8_t(0x20u | (seqTx & 0x0Fu));
+       first[1] = uint8_t((kwpLen >> 8) & 0xFF);
+       first[2] = uint8_t(kwpLen & 0xFF);
+       const uint16_t n0 = (kwpLen < 5u) ? kwpLen : 5u;
+       memcpy(&first[3], kwp, n0);
+       (void)sendRaw(ecuTxId, first, uint8_t(3u + n0));
+       seqTx = uint8_t((seqTx + 1u) & 0x0Fu);
+
+       uint16_t off = n0;
+       while (off < kwpLen) {
+         const uint16_t remain = uint16_t(kwpLen - off);
+         const bool last = (remain <= 7u);
+         uint8_t fr[8];
+         memset(fr, 0, 8);
+         fr[0] = uint8_t((last ? 0x10u : 0x20u) | (seqTx & 0x0Fu));
+         const uint8_t n = uint8_t(remain > 7u ? 7u : remain);
+         memcpy(&fr[1], kwp + off, n);
+         (void)sendRaw(ecuTxId, fr, uint8_t(1u + n));
+         seqTx = uint8_t((seqTx + 1u) & 0x0Fu);
+         off = uint16_t(off + n);
+         if (last)
+           break;
+       }
+       return;
+     }
+
+     uint8_t d[8];
+     memset(d, 0, 8);
+     d[0] = uint8_t(0x10u | (seqTx & 0x0Fu));
+     d[1] = uint8_t((kwpLen >> 8) & 0xFF);
+     d[2] = uint8_t(kwpLen & 0xFF);
+     memcpy(&d[3], kwp, kwpLen);
+     (void)sendRaw(ecuTxId, d, uint8_t(3u + kwpLen));
+     seqTx = uint8_t((seqTx + 1u) & 0x0Fu);
+   }
+
+   void handleKwp(const uint8_t *kwp, uint16_t len) {
+     if (len < 1)
+       return;
+     const uint8_t sid = kwp[0];
+     kwpOkCount++;
+
+     switch (sid) {
+       case 0x10: {
+         uint8_t rsp[2] = {0x50, (len >= 2) ? kwp[1] : uint8_t(0x89)};
+         sendTp20DataLast(rsp, 2);
+         break;
+       }
+       case 0x3E: {
+         uint8_t rsp[1] = {0x7E};
+         sendTp20DataLast(rsp, 1);
+         break;
+       }
+       case 0x14: {
+         uint8_t rsp[1] = {0x54};
+         sendTp20DataLast(rsp, 1);
+         break;
+       }
+       case 0x18: {
+         uint8_t rsp[3] = {0x58, (len >= 2) ? kwp[1] : uint8_t(0x00), 0x00};
+         sendTp20DataLast(rsp, 3);
+         break;
+       }
+       case 0x1A: {
+         const uint8_t id = (len >= 2) ? kwp[1] : uint8_t(0x91);
+         uint8_t rsp[48];
+         memset(rsp, 0, sizeof(rsp));
+         rsp[0] = 0x5A;
+         rsp[1] = id;
+         uint16_t n = 2;
+         if (id == 0x91 || id == 0x9B || id == 0x87 || id == 0x90) {
+           memcpy(&rsp[2], kEcuId91, sizeof(kEcuId91));
+           n = uint16_t(2u + sizeof(kEcuId91));
+         } else {
+           rsp[2] = 'O';
+           rsp[3] = 'K';
+           n = 4;
+         }
+         sendTp20DataLast(rsp, n);
+         break;
+       }
+       case 0x21: {
+         uint8_t rsp[4] = {0x61, (len >= 2) ? kwp[1] : uint8_t(0x01), 0x00, 0x00};
+         sendTp20DataLast(rsp, 4);
+         break;
+       }
+       case 0x22: {
+         uint8_t rsp[3] = {0x7F, 0x22, 0x11};
+         sendTp20DataLast(rsp, 3);
+         break;
+       }
+       default: {
+         uint8_t rsp[3] = {0x7F, sid, 0x11};
+         sendTp20DataLast(rsp, 3);
+         break;
+       }
+     }
+   }
+
+   void onSetupRequest(const CANMessage &m) {
+     if (m.rtr || m.len < 7)
+       return;
+     if (m.data[0] != kAbsLogicalAddr)
+       return;
+     const uint8_t op = m.data[1];
+     if (op == 0x23u) {
+       if (m.data[6] == 0x00u) {
+         uint8_t d[7];
+         memset(d, 0, 7);
+         d[0] = 0x00;
+         d[1] = 0x24;
+         d[2] = m.data[2];
+         d[3] = m.data[3];
+         d[4] = m.data[4];
+         d[5] = m.data[5];
+         d[6] = 0x00;
+         (void)sendRaw(kIdTp20SetupRsp, d, 7);
+       }
+       return;
+     }
+     if (op != 0xC0u)
+       return;
+
+     const uint8_t reqRxLo = m.data[2];
+     const uint8_t reqRxVp = m.data[3];
+     const uint8_t reqTxLo = m.data[4];
+     const uint8_t reqTxVp = m.data[5];
+     const uint8_t app = m.data[6];
+
+     if (idValid(reqTxVp))
+       ecuTxId = decodeCanId(reqTxLo, reqTxVp);
+     else
+       ecuTxId = kTp20DefaultEcuTx;
+
+     // Sempre 0x740 no RX: bate com o filtro fixo do MCP2515
+     (void)reqRxLo;
+     (void)reqRxVp;
+     ecuRxId = kTp20DefaultEcuRx;
+
+     uint8_t rsp[7];
+     rsp[0] = 0x00;
+     rsp[1] = 0xD0;
+     rsp[2] = uint8_t(ecuTxId & 0xFFu);
+     rsp[3] = uint8_t((ecuTxId >> 8) & 0x0Fu);
+     rsp[4] = uint8_t(ecuRxId & 0xFFu);
+     rsp[5] = uint8_t((ecuRxId >> 8) & 0x0Fu);
+     rsp[6] = app ? app : uint8_t(0x01);
+     if (sendRaw(kIdTp20SetupRsp, rsp, 7)) {
+       open = true;
+       seqTx = 0;
+       setupOkCount++;
+     }
+   }
+
+   void onChannelFrame(const CANMessage &m) {
+     if (!open || m.rtr || m.len < 1)
+       return;
+     const uint8_t b0 = m.data[0];
+     const uint8_t op = uint8_t(b0 >> 4);
+     const uint8_t seq = uint8_t(b0 & 0x0Fu);
+
+     if (b0 == 0xA0u || b0 == 0xA3u) {
+       sendChannelParamsRsp();
+       return;
+     }
+     if (b0 == 0xA8u) {
+       uint8_t d[1] = {0xA8};
+       (void)sendRaw(ecuTxId, d, 1);
+       resetChannel();
+       return;
+     }
+     if (b0 == 0xA4u)
+       return;
+     if (op == 0x0Bu || op == 0x09u)
+       return;
+
+     if (op <= 0x03u && m.len >= 3) {
+       if (op == 0x00u || op == 0x01u)
+         sendAck(seq);
+
+       const uint16_t kwpLen = uint16_t((uint16_t(m.data[1]) << 8) | m.data[2]);
+       if (kwpLen == 0 || kwpLen > 64)
+         return;
+       uint8_t kwp[64];
+       memset(kwp, 0, sizeof(kwp));
+       const uint8_t have = uint8_t((m.len > 3u) ? (m.len - 3u) : 0u);
+       if (have)
+         memcpy(kwp, &m.data[3], have);
+
+       if (kwpLen <= have)
+         handleKwp(kwp, kwpLen);
+       else if (have > 0)
+         handleKwp(kwp, have);
+     }
+   }
+
+   void onCanMessage(const CANMessage &m) {
+     const uint16_t id = m.id;
+     if (id == kIdTp20Setup) {
+       onSetupRequest(m);
+       return;
+     }
+     if (open && id == ecuRxId)
+       onChannelFrame(m);
+   }
+ };
+
+ static AbsTp20Diag gAbsDiag;
+
  struct ObdClient {
    uint32_t lastTxMs = 0;
 
@@ -518,6 +908,11 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
          gVehicleMotion.onGetriebe1(m, nowMs);
        } else if (id == kIdGetriebe2) {
          gVehicleMotion.onGetriebe2(m, nowMs);
+       } else if (id == kIdLenkwinkel1) {
+         gSteer.onLenkwinkel1(m, nowMs);
+       } else if (id == kIdTp20Setup || (gAbsDiag.open && id == gAbsDiag.ecuRxId) ||
+                  id == kTp20DefaultEcuRx) {
+         gAbsDiag.onCanMessage(m);
        }
      }
    }
@@ -565,10 +960,11 @@ static float oemAntiDropPanelKmh(float panelIn, float dtSec, uint32_t nowMs) {
    writeBitsLE(d, 49, 15, raw);
  }
 
- static void buildBremse2(uint8_t *d, float kmh, uint16_t zeitTicks, uint16_t weg11, uint8_t imp6) {
+ static void buildBremse2(uint8_t *d, float kmh, uint16_t zeitTicks, uint16_t weg11, uint8_t imp6,
+                           uint8_t querRaw) {
    memset(d, 0, 8);
    writeBitsLE(d, 8, 1, 1);
-   writeBitsLE(d, 0, 8, kBr2QuerNeutral);
+   writeBitsLE(d, 0, 8, querRaw);
 
    const float mid = kmhToMidRevs(kmh);
    const uint16_t rawMid = uint16_t(midRevsToRaw(mid) & 0x7FFFu);
@@ -618,13 +1014,13 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
    d[7] = x;
  }
 
- static void buildBremse8Idle(uint8_t *d) {
+ static void buildBremse8Idle(uint8_t *d, uint16_t latRaw, uint16_t longRaw) {
    memset(d, 0, 8);
    writeBitsLE(d, 8, 4, uint32_t(gBr8Zaehler & 0x0Fu));
    writeBitsLE(d, 16, 8, kBr8TolNeutral);
    writeBitsLE(d, 24, 8, kBr8TolNeutral);
-   writeBitsLE(d, 32, 9, uint32_t(kBr8LatNeutral & 0x1FFu));
-   writeBitsLE(d, 48, 10, uint32_t(kBr8LongNeutral & 0x3FFu));
+   writeBitsLE(d, 32, 9, uint32_t(latRaw & 0x1FFu));
+   writeBitsLE(d, 48, 10, uint32_t(longRaw & 0x3FFu));
    uint8_t x = 0;
    for (int i = 1; i < 8; ++i)
      x ^= d[i];
@@ -695,7 +1091,7 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
  void setup() {
    Serial.begin(115200);
    delay(200);
-   Serial.println(F("MK60 PQ35 ABS emu | SO NEUTRO | sem TP20/G85 dinamico"));
+   Serial.println(F("MK60 PQ35 ABS emu | OBD+cambio | TP2.0 addr 03"));
    Serial.print(F("Reset reason: "));
    Serial.println(resetReasonStr(esp_reset_reason()));
 
@@ -709,6 +1105,9 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
        {standard2515Filter(kConfig.obdTransRsp, 0x00, 0x00), nullptr},
        {standard2515Filter(kIdGetriebe1, 0x00, 0x00), nullptr},
        {standard2515Filter(kIdGetriebe2, 0x00, 0x00), nullptr},
+       {standard2515Filter(kIdTp20Setup, 0x00, 0x00), nullptr},
+       {standard2515Filter(kTp20DefaultEcuRx, 0x00, 0x00), nullptr},
+       {standard2515Filter(kIdLenkwinkel1, 0x00, 0x00), nullptr},
    };
 
    uint16_t err = 0;
@@ -728,9 +1127,10 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
      delay(200);
      esp_restart();
    }
-   Serial.println(F("MCP2515 OK @ 500k | RX 7E9/440/540"));
+   Serial.println(F("MCP2515 OK @ 500k | RX 7E9/440/540/200/740/C2"));
 
    gObd.setup();
+   gAbsDiag.resetChannel();
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
    {
@@ -798,6 +1198,7 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
 
    const float dtOdo = fminf(dtSec, 0.08f);
    gOdo.integrate(kmhOdo, dtOdo);
+   gAccel.tick(kmhAbsTx, dtSec, ms);
    gObd.pollReceive(ms);
 
    static uint16_t sZeit = 0;
@@ -805,6 +1206,10 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
    uint8_t b1[8], b3[8], b2[8], b10[8];
    static uint32_t txFail1A0 = 0, txFail4A0 = 0, txFail5A0 = 0, txFail3A0 = 0;
    static uint32_t txFailEsp = 0;
+
+   const uint8_t querRaw = gSteer.calibrated(ms) ? gAccel.br2QuerRaw() : kBr2QuerNeutral;
+   const uint16_t latRaw = gSteer.calibrated(ms) ? gAccel.br8LatRaw() : kBr8LatNeutral;
+   const uint16_t longRaw = gAccel.br8LongRaw();
 
    if (tick10ms) {
      sZeit = uint16_t(sZeit + 10);
@@ -821,7 +1226,7 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
    if (t20.poll(usNow)) {
      uint16_t wvl, wvr, whl, whr;
      gOdo.weg10Wheels(&wvl, &wvr, &whl, &whr);
-     buildBremse2(b2, kmhPanelTx, sZeit, gOdo.weg11FrontAxle(), gOdo.impulszahlForBremse2());
+     buildBremse2(b2, kmhPanelTx, sZeit, gOdo.weg11FrontAxle(), gOdo.impulszahlForBremse2(), querRaw);
      buildBremse10(b10, wvl, wvr, whl, whr);
      if (!sendFrame(kIdBremse2, b2))
        txFail5A0++;
@@ -834,7 +1239,7 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
        uint8_t b5[8], b8[8], b6[3], b11[8];
        const bool stillstand = (kmhAbsTx < 1.0f);
        buildBremse5Idle(b5, stillstand);
-       buildBremse8Idle(b8);
+       buildBremse8Idle(b8, latRaw, longRaw);
        buildBremse6Idle(b6);
        buildBremse11Idle(b11);
        if (sendFrame(kIdBremse5, b5))
@@ -921,6 +1326,26 @@ static void buildBremse5Idle(uint8_t *d, bool stillstand) {
      Serial.print(txFail3A0);
      Serial.print('/');
      Serial.println(txFailEsp);
+     Serial.print(F(" | G85 deg/st/ok aLat/aLong: "));
+     Serial.print(gSteer.angleDeg, 1);
+     Serial.print('/');
+     Serial.print(gSteer.status, DEC);
+     Serial.print('/');
+     Serial.print(gSteer.calibrated(ms) ? 1 : 0);
+     Serial.print(' ');
+     Serial.print(gAccel.aLatMs2, 2);
+     Serial.print('/');
+     Serial.println(gAccel.aLongMs2, 2);
+     Serial.print(F("TP20 setup/kwp/open rx/tx: "));
+     Serial.print(gAbsDiag.setupOkCount);
+     Serial.print('/');
+     Serial.print(gAbsDiag.kwpOkCount);
+     Serial.print('/');
+     Serial.print(gAbsDiag.open ? 1 : 0);
+     Serial.print(' ');
+     Serial.print(gAbsDiag.ecuRxId, HEX);
+     Serial.print('/');
+     Serial.println(gAbsDiag.ecuTxId, HEX);
      if (stackWM < 512u)
        Serial.println(F("[WARN] Stack baixa!"));
    }
